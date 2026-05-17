@@ -48,6 +48,7 @@ import {
 	ControllerRole,
 	ControllerStatus,
 	EMPTY_ROUTE,
+	EncapsulationFlags,
 	type Firmware,
 	LongRangeChannel,
 	MAX_NODES,
@@ -9823,14 +9824,19 @@ export class ZWaveController
 			);
 		}
 		this.driver.controllerLog.print(
-			`bridge: notifyPrimaryOfProxyInclusion(newNode=${newNodeId}, primary=${primaryNodeId}) — sending InclusionControllerCC.Initiate(ProxyInclusion)`,
+			`bridge: notifyPrimaryOfProxyInclusion(newNode=${newNodeId}, primary=${primaryNodeId}) — sending InclusionControllerCC.Initiate(ProxyInclusion) [S2-wrapped]`,
 		);
 		// createAPI(... , false) skips support check — the primary always
 		// implements this CC even if its NIF doesn't advertise it explicitly.
+		// .withOptions({encapsulationFlags: Security}) forces S2 wrapping.
+		// Empirical: HA's zwave-js drops Inclusion Controller CC frames that
+		// arrive at a security level below what's expected for the source
+		// node (Pi, included with S2_Authenticated). Without explicit force,
+		// zwave-js's auto-encapsulation chose a lower class here.
 		const api = primary.createAPI(
 			CommandClasses["Inclusion Controller"],
 			false,
-		);
+		).withOptions({ encapsulationFlags: EncapsulationFlags.Security });
 		await api.initiateStep(
 			newNodeId,
 			InclusionControllerStep.ProxyInclusion,
