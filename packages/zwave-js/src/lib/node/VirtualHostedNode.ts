@@ -61,7 +61,17 @@ const SPECIFIC_DEVICE_CLASS_BINARY_POWER_SWITCH = 0x01;
  * The "Multilevel Dimmer Plus" profile. CCs cover: paddle dim/level reports
  * (MultilevelSwitch + Basic), management (Association + Multi Channel
  * Association + Association Group Info), interrogation (Version + Z-Wave
- * Plus Info + Manufacturer Specific), and Security (S0 + S2).
+ * Plus Info + Manufacturer Specific).
+ *
+ * Note: Security and Security 2 are intentionally OMITTED. A virtual slave
+ * hosted on the bridge controller can't truly participate in S2 KEX with
+ * other primaries (no shared key material), and advertising S2 support
+ * causes those primaries to attempt KEX, then hit an unhandled-rejection
+ * crash in their proxyBootstrap path. Paddles associating to this node
+ * still encrypt their own outbound commands with the network's S2 keys —
+ * the radio (which holds those keys via the SIS) decrypts on the virtual
+ * slave's behalf. So omitting S2 from the NIF only skips KEX, not actual
+ * over-the-wire encryption.
  */
 export const PROFILE_DIMMER: VirtualHostedNodeNIF = {
 	basicDeviceClass: BASIC_DEVICE_CLASS_ROUTING_SLAVE,
@@ -76,8 +86,6 @@ export const PROFILE_DIMMER: VirtualHostedNodeNIF = {
 		CommandClasses.Version,
 		CommandClasses["Z-Wave Plus Info"],
 		CommandClasses["Manufacturer Specific"],
-		CommandClasses.Security,
-		CommandClasses["Security 2"],
 	],
 	controlledCCs: [],
 };
@@ -99,8 +107,6 @@ export const PROFILE_BINARY: VirtualHostedNodeNIF = {
 		CommandClasses.Version,
 		CommandClasses["Z-Wave Plus Info"],
 		CommandClasses["Manufacturer Specific"],
-		CommandClasses.Security,
-		CommandClasses["Security 2"],
 	],
 	controlledCCs: [],
 };
