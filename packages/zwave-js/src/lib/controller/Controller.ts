@@ -198,6 +198,8 @@ import {
 	type GetSerialApiCapabilitiesResponse,
 	GetSerialApiInitDataRequest,
 	type GetSerialApiInitDataResponse,
+	GetVirtualNodesRequest,
+	type GetVirtualNodesResponse,
 	HardResetRequest,
 	IsFailedNodeRequest,
 	type IsFailedNodeResponse,
@@ -1097,6 +1099,33 @@ export class ZWaveController
 					.join("")
 			}`,
 		);
+
+		// CHECKPOINT 1 PROBE: if the radio firmware supports Bridge Controller
+		// virtual-node functions, query the current list of hosted virtual
+		// nodes at startup. Confirms our serial-layer message classes round-
+		// trip cleanly against real hardware. Should log an empty list until
+		// a virtual node is provisioned (Phase 4+).
+		if (
+			this._supportedFunctionTypes.includes(FunctionType.GetVirtualNodes)
+		) {
+			try {
+				const vn = await this.driver.sendMessage<
+					GetVirtualNodesResponse
+				>(new GetVirtualNodesRequest(), { supportCheck: false });
+				this.driver.controllerLog.print(
+					`bridge controller: hosted virtual nodes = [${
+						vn.virtualNodeIds.join(", ")
+					}] (count=${vn.virtualNodeIds.length})`,
+				);
+			} catch (e) {
+				this.driver.controllerLog.print(
+					`bridge controller probe failed: ${
+						(e as Error)?.message ?? e
+					}`,
+					"warn",
+				);
+			}
+		}
 
 		// Request additional information about the controller/Z-Wave chip
 		const initData = await this.getSerialApiInitData();
