@@ -271,6 +271,9 @@ import {
 	SlaveLearnModeStatus,
 	IsVirtualNodeRequest,
 	type IsVirtualNodeResponse,
+	VirtualNodeSendNodeInfoCallback,
+	VirtualNodeSendNodeInfoRequest,
+	type VirtualNodeSendNodeInfoResponse,
 	VirtualNodeSetNodeInfoRequest,
 	SetLongRangeChannelRequest,
 	type SetLongRangeChannelResponse,
@@ -447,6 +450,10 @@ export class ZWaveController
 		driver.registerRequestHandler(
 			FunctionType.VirtualNodeSetLearnMode,
 			this.handleSlaveLearnModeCallback.bind(this),
+		);
+		driver.registerRequestHandler(
+			FunctionType.VirtualNodeSendNodeInfo,
+			this.handleSendSlaveNodeInfoCallback.bind(this),
 		);
 	}
 
@@ -9731,6 +9738,90 @@ export class ZWaveController
 			);
 		}
 		return result.success;
+	}
+
+	private _pendingSendSlaveNodeInfo?: {
+		srcNodeId: number;
+		destNodeId: number;
+		resolve: (cb: VirtualNodeSendNodeInfoCallback) => void;
+		reject: (e: Error) => void;
+		startedAt: number;
+	};
+
+	/**
+	 * Broadcasts the NIF for a hosted virtual slave to a target controller
+	 * (typically NodeID 1 — the network's primary). Required follow-up to
+	 * AssignNodeIdDone — without it, other primaries don't learn the new
+	 * virtual slave exists. Per OpenZWave Driver.cpp:6068-6093 reference.
+	 */
+	public async advertiseVirtualNode(
+		srcNodeId: number,
+		destNodeId: number,
+	): Promise<VirtualNodeSendNodeInfoCallback> {
+		if (this._pendingSendSlaveNodeInfo) {
+			throw new ZWaveError(
+				"A VirtualNodeSendNodeInfo is already in progress",
+				ZWaveErrorCodes.Controller_CommandError,
+			);
+		}
+		this.driver.controllerLog.print(
+			`bridge: advertiseVirtualNode(src=${srcNodeId}, dest=${destNodeId}) — sending VirtualNodeSendNodeInfo`,
+		);
+		const res = await this.driver.sendMessage<
+			VirtualNodeSendNodeInfoResponse
+		>(
+			new VirtualNodeSendNodeInfoRequest({
+				srcNodeId,
+				destNodeId,
+			}),
+			{ supportCheck: false },
+		);
+		if (!res.success) {
+			throw new ZWaveError(
+				`Radio refused VirtualNodeSendNodeInfo (src=${srcNodeId}, dest=${destNodeId})`,
+				ZWaveErrorCodes.Controller_CommandError,
+			);
+		}
+		this.driver.controllerLog.print(
+			`bridge: radio accepted VirtualNodeSendNodeInfo; awaiting tx-callback…`,
+		);
+		return new Promise<VirtualNodeSendNodeInfoCallback>(
+			(resolve, reject) => {
+				this._pendingSendSlaveNodeInfo = {
+					srcNodeId,
+					destNodeId,
+					resolve,
+					reject,
+					startedAt: Date.now(),
+				};
+			},
+		);
+	}
+
+	private async handleSendSlaveNodeInfoCallback(
+		msg: VirtualNodeSendNodeInfoCallback,
+	): Promise<boolean> {
+		this.driver.controllerLog.print(
+			`bridge: VirtualNodeSendNodeInfo callback — txStatus=0x${
+				msg.txStatus.toString(16)
+			} callbackId=${msg.callbackId}`,
+		);
+		const pending = this._pendingSendSlaveNodeInfo;
+		if (!pending) {
+			this.driver.controllerLog.print(
+				`bridge: VirtualNodeSendNodeInfo callback received with no pending request — ignoring`,
+				"warn",
+			);
+			return true;
+		}
+		this._pendingSendSlaveNodeInfo = undefined;
+		this.driver.controllerLog.print(
+			`bridge: VirtualNodeSendNodeInfo from ${pending.srcNodeId} → ${pending.destNodeId} completed after ${
+				Date.now() - pending.startedAt
+			} ms (txStatus=${msg.isOK() ? "OK" : `0x${msg.txStatus.toString(16)}`})`,
+		);
+		pending.resolve(msg);
+		return true;
 	}
 
 	private async handleSlaveLearnModeCallback(

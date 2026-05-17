@@ -2418,14 +2418,32 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			void (async () => {
 				try {
 					this.controllerLog.print(
-						`PROTOTYPE: starting virtual-node inclusion (profile=${protoProfile}) — trigger Add Node on the primary controller now`,
+						`PROTOTYPE: starting virtual-node inclusion (profile=${protoProfile})`,
 					);
 					const cb = await this._controller!.beginAddingVirtualNode(
 						protoProfile,
 					);
 					this.controllerLog.print(
-						`PROTOTYPE: virtual-node inclusion DONE — newNodeId=${cb.newNodeId} originalNodeId=${cb.originalNodeId}`,
+						`PROTOTYPE: virtual-node ALLOCATED — newNodeId=${cb.newNodeId}; now advertising NIF to HA (node 1)…`,
 					);
+					try {
+						const advCb = await this._controller!
+							.advertiseVirtualNode(cb.newNodeId, 1);
+						this.controllerLog.print(
+							`PROTOTYPE: NIF advertised — txStatus=0x${
+								advCb.txStatus.toString(16)
+							}`,
+						);
+					} catch (advErr) {
+						this.controllerLog.print(
+							`PROTOTYPE: NIF advertise FAILED: ${
+								advErr instanceof Error
+									? advErr.message
+									: String(advErr)
+							}`,
+							"error",
+						);
+					}
 				} catch (e) {
 					this.controllerLog.print(
 						`PROTOTYPE: virtual-node inclusion FAILED: ${
@@ -2435,6 +2453,46 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					);
 				}
 			})();
+		}
+
+		// Phase 4b prototype: advertise an EXISTING virtual node's NIF to HA.
+		// Set ZWAVE_JS_PROTOTYPE_ADVERTISE=<srcNodeId> to push that node's NIF
+		// to HA (NodeID 1). Use after a successful ADD to make HA learn about
+		// an already-allocated virtual slave (e.g. node 111 from a prior
+		// session that HA still hasn't discovered).
+		const advertiseSrc = process.env.ZWAVE_JS_PROTOTYPE_ADVERTISE;
+		if (advertiseSrc) {
+			const srcNodeId = Number(advertiseSrc);
+			if (Number.isInteger(srcNodeId) && srcNodeId > 0) {
+				void (async () => {
+					try {
+						this.controllerLog.print(
+							`PROTOTYPE: advertising existing virtual node ${srcNodeId} to HA (node 1)…`,
+						);
+						const cb = await this._controller!.advertiseVirtualNode(
+							srcNodeId,
+							1,
+						);
+						this.controllerLog.print(
+							`PROTOTYPE: advertise DONE — txStatus=0x${
+								cb.txStatus.toString(16)
+							}`,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`PROTOTYPE: advertise FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"error",
+						);
+					}
+				})();
+			} else {
+				this.controllerLog.print(
+					`PROTOTYPE: invalid ZWAVE_JS_PROTOTYPE_ADVERTISE=${advertiseSrc}; expected positive integer`,
+					"warn",
+				);
+			}
 		}
 
 		// Add event handlers for the nodes

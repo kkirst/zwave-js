@@ -22,6 +22,7 @@ export * from "./serialapi/misc/IsVirtualNodeMessages.js";
 export * from "./serialapi/misc/SetRFReceiveModeMessages.js";
 export * from "./serialapi/misc/SetSerialApiTimeoutsMessages.js";
 export * from "./serialapi/misc/SoftResetRequest.js";
+export * from "./serialapi/misc/VirtualNodeSendNodeInfoMessages.js";
 export * from "./serialapi/misc/VirtualNodeSetNodeInfoMessages.js";
 export * from "./serialapi/misc/WatchdogMessages.js";
 export * from "./serialapi/network-mgmt/AddNodeToNetworkRequest.js";
