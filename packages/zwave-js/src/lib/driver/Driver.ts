@@ -234,6 +234,10 @@ import type { Endpoint } from "../node/Endpoint.js";
 import type { ZWaveNode } from "../node/Node.js";
 import { VirtualHostedNode } from "../node/VirtualHostedNode.js";
 import {
+	loadVirtualNodes,
+	saveVirtualNodes,
+} from "../node/VirtualHostedNodesStore.js";
+import {
 	InterviewStage,
 	NodeStatus,
 	type ZWaveNodeEventCallbacks,
@@ -1084,6 +1088,17 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 	 */
 	public readonly virtualNodes = new Map<number, VirtualHostedNode>();
 
+	/**
+	 * Atomically persist the current `virtualNodes` registry to
+	 * `<cacheDir>/virtual-nodes.json`. Called automatically during driver
+	 * shutdown; callers may also invoke explicitly after mutating virtual-
+	 * node state (e.g., after inclusion or association updates). Cheap
+	 * enough to call freely — a few KB of JSON, atomic rename, no fsync.
+	 */
+	public async saveVirtualHostedNodes(): Promise<void> {
+		await saveVirtualNodes(this.cacheDir, this.virtualNodes.values());
+	}
+
 	/** A map of Node ID -> ongoing sessions */
 	private nodeSessions = new Map<number, Sessions>();
 	private ensureNodeSessions(nodeId: number): Sessions {
@@ -1753,6 +1768,31 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 
 				void this.destroyWithMessage(message);
 				return;
+			}
+
+			// Restore previously-persisted virtual hosted nodes from
+			// virtual-nodes.json in the cache directory. Non-fatal: if
+			// the file is corrupt, log + continue with an empty registry
+			// rather than killing the whole driver (the user can re-provision).
+			try {
+				const restored = await loadVirtualNodes(this.cacheDir);
+				for (const vn of restored) {
+					this.virtualNodes.set(vn.id, vn);
+				}
+				if (restored.length > 0) {
+					this.driverLog.print(
+						`restored ${restored.length} virtual hosted node(s): [${
+							restored.map((n) => n.id).join(", ")
+						}]`,
+					);
+				}
+			} catch (e) {
+				this.driverLog.print(
+					`failed to restore virtual hosted nodes (continuing with empty registry): ${
+						(e as Error)?.message ?? e
+					}`,
+					"warn",
+				);
 			}
 
 			// Load the necessary configuration
@@ -3908,6 +3948,20 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		this._destroyPromise = createDeferredPromise();
 
 		this.driverLog.print("destroying driver instance...");
+
+		// Persist virtual hosted nodes BEFORE tearing down serial/scheduler,
+		// so any in-flight state survives. Non-fatal on failure — we'd
+		// rather lose pending persistence than block driver shutdown.
+		try {
+			await this.saveVirtualHostedNodes();
+		} catch (e) {
+			this.driverLog.print(
+				`failed to save virtual hosted nodes during shutdown: ${
+					(e as Error)?.message ?? e
+				}`,
+				"warn",
+			);
+		}
 
 		// First stop the scheduler, all queues and close the serial port, so nothing happens anymore
 		await this._scheduler.stop();
