@@ -9614,6 +9614,41 @@ export class ZWaveController
 		callbacks: SetSlaveLearnModeCallback[];
 	};
 
+	/**
+	 * Installs the dimmer/binary profile NIF for an already-allocated virtual
+	 * slot. Required before primaries will see the correct device class via
+	 * GetNodeInfo. Safe to re-call at any time to refresh a slot's NIF.
+	 */
+	public async setVirtualNodeNIF(
+		nodeId: number,
+		profile: VirtualHostedNodeProfile,
+	): Promise<void> {
+		const nif = profileNIF(profile);
+		this.driver.controllerLog.print(
+			`bridge: setVirtualNodeNIF(nodeId=${nodeId}, profile=${profile}) — generic=0x${
+				nif.genericDeviceClass.toString(16)
+			} specific=0x${
+				nif.specificDeviceClass.toString(16)
+			} supportedCCs=[${
+				nif.supportedCCs.map((c) => `0x${c.toString(16)}`).join(",")
+			}]`,
+		);
+		// Fire-and-forget: mirrors SetApplicationNodeInformationRequest (0x03).
+		await this.driver.sendMessage(
+			new VirtualNodeSetNodeInfoRequest({
+				nodeId,
+				listening: true,
+				genericDeviceClass: nif.genericDeviceClass,
+				specificDeviceClass: nif.specificDeviceClass,
+				supportedCCs: nif.supportedCCs as readonly number[],
+			}),
+			{ supportCheck: false },
+		);
+		this.driver.controllerLog.print(
+			`bridge: setVirtualNodeNIF ACKed by radio (fire-and-forget)`,
+		);
+	}
+
 	public async beginAddingVirtualNode(
 		profile: VirtualHostedNodeProfile,
 	): Promise<SetSlaveLearnModeCallback> {
@@ -9623,67 +9658,6 @@ export class ZWaveController
 				ZWaveErrorCodes.Controller_CommandError,
 			);
 		}
-		// Step 1: probe which slot IDs the radio recognizes as virtual. SiLabs
-		// 700/800-series radios typically reserve a small range of high node IDs
-		// for virtual slaves; we probe 232-239 as the standard SDK default.
-		this.driver.controllerLog.print(
-			`bridge: beginAddingVirtualNode(profile=${profile}) — probing virtual slot range 232-239`,
-		);
-		const virtualSlots: number[] = [];
-		for (let id = 232; id <= 239; id++) {
-			try {
-				const ivn = await this.driver.sendMessage<
-					IsVirtualNodeResponse
-				>(new IsVirtualNodeRequest({ nodeId: id }), {
-					supportCheck: false,
-				});
-				this.driver.controllerLog.print(
-					`bridge:   IsVirtualNode(${id}) = ${ivn.isVirtual}`,
-				);
-				if (ivn.isVirtual) virtualSlots.push(id);
-			} catch (e) {
-				this.driver.controllerLog.print(
-					`bridge:   IsVirtualNode(${id}) failed: ${
-						e instanceof Error ? e.message : String(e)
-					}`,
-					"warn",
-				);
-			}
-		}
-		this.driver.controllerLog.print(
-			`bridge: pre-allocated virtual slots = [${virtualSlots.join(", ")}]`,
-		);
-
-		// Step 2: install NIF for our chosen slot. If no slots are pre-allocated
-		// we optimistically try slot 232 anyway — some firmwares accept
-		// SetNodeInfo as the implicit allocation mechanism (the slot becomes
-		// virtual after SetNodeInfo succeeds).
-		const targetSlot = virtualSlots[0] ?? 232;
-		const nif = profileNIF(profile);
-		this.driver.controllerLog.print(
-			`bridge: SetNodeInfo(slot=${targetSlot}) generic=0x${
-				nif.genericDeviceClass.toString(16)
-			} specific=0x${
-				nif.specificDeviceClass.toString(16)
-			} supportedCCs=[${
-				nif.supportedCCs.map((c) => `0x${c.toString(16)}`).join(",")
-			}]`,
-		);
-		// Fire-and-forget: no Response is sent, so don't wait for one. Mirrors
-		// SetApplicationNodeInformationRequest (0x03) — radio ACKs and stores.
-		await this.driver.sendMessage(
-			new VirtualNodeSetNodeInfoRequest({
-				nodeId: targetSlot,
-				listening: true,
-				genericDeviceClass: nif.genericDeviceClass,
-				specificDeviceClass: nif.specificDeviceClass,
-				supportedCCs: nif.supportedCCs as readonly number[],
-			}),
-			{ supportCheck: false },
-		);
-		this.driver.controllerLog.print(
-			`bridge: SetNodeInfo ACKed by radio (fire-and-forget)`,
-		);
 
 		// Step 3: initiate ADD on our own authority. As of the 2026-05-17 SIS
 		// handover, the Pi is now SUC/SIS (Inclusion Controller) so per SiLabs

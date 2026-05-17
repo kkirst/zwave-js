@@ -2423,12 +2423,29 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					const cb = await this._controller!.beginAddingVirtualNode(
 						protoProfile,
 					);
+					const newId = cb.newNodeId;
 					this.controllerLog.print(
-						`PROTOTYPE: virtual-node ALLOCATED — newNodeId=${cb.newNodeId}; now advertising NIF to HA (node 1)…`,
+						`PROTOTYPE: virtual-node ALLOCATED — newNodeId=${newId}; setting NIF…`,
+					);
+					try {
+						await this._controller!.setVirtualNodeNIF(
+							newId,
+							protoProfile,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`PROTOTYPE: SetNodeInfo FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"error",
+						);
+					}
+					this.controllerLog.print(
+						`PROTOTYPE: advertising NIF to HA (node 1)…`,
 					);
 					try {
 						const advCb = await this._controller!
-							.advertiseVirtualNode(cb.newNodeId, 1);
+							.advertiseVirtualNode(newId, 1);
 						this.controllerLog.print(
 							`PROTOTYPE: NIF advertised — txStatus=0x${
 								advCb.txStatus.toString(16)
@@ -2444,6 +2461,22 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 							"error",
 						);
 					}
+					this.controllerLog.print(
+						`PROTOTYPE: notifying HA primary via InclusionControllerCC.Initiate…`,
+					);
+					try {
+						await this._controller!.notifyPrimaryOfProxyInclusion(
+							newId,
+							1,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`PROTOTYPE: notify FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"error",
+						);
+					}
 				} catch (e) {
 					this.controllerLog.print(
 						`PROTOTYPE: virtual-node inclusion FAILED: ${
@@ -2453,6 +2486,51 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					);
 				}
 			})();
+		}
+
+		// Phase 4b prototype: re-set NIF + re-notify for an EXISTING virtual
+		// node that was allocated before we had the proper NIF flow. Format:
+		// ZWAVE_JS_PROTOTYPE_FIX_NIF=<nodeId>:<dimmer|binary>
+		// e.g. ZWAVE_JS_PROTOTYPE_FIX_NIF=111:dimmer
+		const fixNif = process.env.ZWAVE_JS_PROTOTYPE_FIX_NIF;
+		if (fixNif) {
+			const [idStr, prof] = fixNif.split(":");
+			const fixId = Number(idStr);
+			if (
+				Number.isInteger(fixId) && fixId > 0
+				&& (prof === "dimmer" || prof === "binary")
+			) {
+				void (async () => {
+					try {
+						this.controllerLog.print(
+							`PROTOTYPE: fixing NIF for existing virtual node ${fixId} (profile=${prof})…`,
+						);
+						await this._controller!.setVirtualNodeNIF(fixId, prof);
+						this.controllerLog.print(
+							`PROTOTYPE: NIF set; re-notifying HA primary via InclusionControllerCC.Initiate…`,
+						);
+						await this._controller!.notifyPrimaryOfProxyInclusion(
+							fixId,
+							1,
+						);
+						this.controllerLog.print(
+							`PROTOTYPE: fix DONE — HA should refresh node ${fixId}'s device class`,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`PROTOTYPE: fix FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"error",
+						);
+					}
+				})();
+			} else {
+				this.controllerLog.print(
+					`PROTOTYPE: invalid ZWAVE_JS_PROTOTYPE_FIX_NIF=${fixNif}; expected <nodeId>:<dimmer|binary>`,
+					"warn",
+				);
+			}
 		}
 
 		// Phase 4b prototype: advertise an EXISTING virtual node's NIF to HA.
