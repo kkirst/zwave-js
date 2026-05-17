@@ -6477,7 +6477,22 @@ ${handlers.length} left`,
 	/** Persists the values contained in a Command Class in the corresponding nodes's value DB */
 	private persistCCValues(cc: CommandClass) {
 		if (this.shouldPersistCCValues(cc)) {
-			cc.persistValues(this);
+			try {
+				cc.persistValues(this);
+			} catch (e) {
+				// WORKAROUND: stale per-node ValueDB references against a closed
+				// JsonlDB can throw here (Controller.afterJoiningNetwork bug); the
+				// raw throw kills the whole driver via the unhandled-exception path.
+				// Caught + logged so the driver survives. Ported from a hot-patch on
+				// the live Pi controller; remove when the underlying bug is fixed
+				// upstream.
+				this.driverLog.print(
+					`persistCCValues threw (continuing): ${
+						(e as Error)?.stack ?? (e as Error)?.message ?? e
+					}`,
+					"warn",
+				);
+			}
 		}
 
 		if (isEncapsulatingCommandClass(cc)) {
