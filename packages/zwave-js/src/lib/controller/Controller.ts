@@ -4132,9 +4132,59 @@ export class ZWaveController
 				s0result?.status === InclusionControllerStatus.OK,
 			);
 		} else {
-			// Remember that no security classes were granted
-			for (const secClass of securityClassOrder) {
-				newNode.securityClasses.set(secClass, false);
+			// No Security CC, no Security 2 CC in NIF — by default no security
+			// classes are granted. EXCEPTION: if the inclusion controller is
+			// itself at S2 (or any granted class), inherit the inclusion
+			// controller's highest security class. This handles the bridge-
+			// controller virtual-slave case where:
+			//   - the host can't run S2 KEX on the slave's behalf (no real key
+			//     material to exchange)
+			//   - but the inclusion controller's NETWORK keys are what's
+			//     actually used to encrypt wire frames addressed to the slave
+			//   - so on the wire, paddle ↔ virtual-slave traffic IS S2 secured
+			//     via the radio that hosts the slave (which holds the keys)
+			//
+			// Without this inheritance, downstream association checks
+			// (Forbidden_SecurityClassMismatch) prevent paddles from
+			// associating to virtual slaves even though the wire encryption
+			// would work fine.
+			// Grant a virtual S2_Authenticated class to proxy-included nodes
+			// whose NIF doesn't claim native Security CC support, IF the
+			// inclusion controller is itself S2-secured. This unblocks
+			// Forbidden_SecurityClassMismatch on associations from typical
+			// paddles (which are usually included at S2_Authenticated — in
+			// this user's network, 51 of 53 non-controller nodes use it).
+			//
+			// We pick S2_Authenticated specifically (not the inclusion
+			// controller's actual highest) because the spec's "same-class"
+			// association check (AssociationCC v<3 / MCA v<4) requires
+			// strict equality of highest-classes between source and target.
+			// Matching the dominant paddle class maximizes association
+			// compatibility.
+			//
+			// Wire-level S2 encryption still works because the radio that
+			// hosts the virtual slave has the network's S2_Authenticated
+			// keys (Pi was included at S2_AccessControl which grants the
+			// lower keys too) and decrypts inbound frames.
+			const inclCtrlrClass = inclCtrlr.getHighestSecurityClass();
+			const inclCtrlrIsS2 = inclCtrlrClass != undefined
+				&& inclCtrlrClass !== SecurityClass.None
+				&& inclCtrlrClass !== SecurityClass.S0_Legacy;
+			if (inclCtrlrIsS2) {
+				for (const secClass of securityClassOrder) {
+					newNode.securityClasses.set(
+						secClass,
+						secClass === SecurityClass.S2_Authenticated,
+					);
+				}
+				this.driver.controllerLog.logNode(
+					newNode.id,
+					`granted S2_Authenticated (proxy-bridge trust via inclusion controller ${inclCtrlr.id}, native Security CC absent)`,
+				);
+			} else {
+				for (const secClass of securityClassOrder) {
+					newNode.securityClasses.set(secClass, false);
+				}
 			}
 		}
 
