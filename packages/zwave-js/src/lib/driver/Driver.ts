@@ -2495,6 +2495,46 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			}
 		}
 
+		// Phase 4c prototype: notify HA (primary) about an existing virtual
+		// slave via Inclusion Controller CC Initiate(ProxyInclusion). HA's
+		// handleInclusionControllerCCInitiateProxyInclusion will then create
+		// the new node entry in its bitmap + run the interview.
+		//
+		// Set ZWAVE_JS_PROTOTYPE_NOTIFY_PRIMARY=<srcNodeId> to push that
+		// node's existence to HA via the spec-correct mechanism.
+		const notifySrc = process.env.ZWAVE_JS_PROTOTYPE_NOTIFY_PRIMARY;
+		if (notifySrc) {
+			const srcNodeId = Number(notifySrc);
+			if (Number.isInteger(srcNodeId) && srcNodeId > 0) {
+				void (async () => {
+					try {
+						this.controllerLog.print(
+							`PROTOTYPE: notifying HA primary about virtual node ${srcNodeId} via InclusionControllerCC.Initiate…`,
+						);
+						await this._controller!.notifyPrimaryOfProxyInclusion(
+							srcNodeId,
+							1,
+						);
+						this.controllerLog.print(
+							`PROTOTYPE: notify DONE — HA should now process the new node`,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`PROTOTYPE: notify FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"error",
+						);
+					}
+				})();
+			} else {
+				this.controllerLog.print(
+					`PROTOTYPE: invalid ZWAVE_JS_PROTOTYPE_NOTIFY_PRIMARY=${notifySrc}; expected positive integer`,
+					"warn",
+				);
+			}
+		}
+
 		// Add event handlers for the nodes
 		for (const node of this._controller.nodes.values()) {
 			this.addNodeEventHandlers(node);

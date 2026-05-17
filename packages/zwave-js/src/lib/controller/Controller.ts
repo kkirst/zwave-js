@@ -9798,6 +9798,48 @@ export class ZWaveController
 		);
 	}
 
+	/**
+	 * Notify a primary controller about a virtual slave we just added on this
+	 * (Inclusion Controller / SIS) controller, using the standard Inclusion
+	 * Controller CC mechanism. The primary's
+	 * handleInclusionControllerCCInitiateProxyInclusion will see this and
+	 * create the new node entry in its bitmap + run the node interview.
+	 *
+	 * This is the spec-correct way to make a Primary learn about a node added
+	 * by a different inclusion controller (the SIS). Sending the NIF alone
+	 * via VirtualNodeSendNodeInfo is informational and primaries don't
+	 * promote unknown NodeIDs from it.
+	 */
+	public async notifyPrimaryOfProxyInclusion(
+		newNodeId: number,
+		primaryNodeId: number = 1,
+	): Promise<void> {
+		const primary = this.nodes.get(primaryNodeId);
+		if (!primary) {
+			throw new ZWaveError(
+				`Primary node ${primaryNodeId} not in controller's node list`,
+				ZWaveErrorCodes.Controller_NodeNotFound,
+				primaryNodeId,
+			);
+		}
+		this.driver.controllerLog.print(
+			`bridge: notifyPrimaryOfProxyInclusion(newNode=${newNodeId}, primary=${primaryNodeId}) — sending InclusionControllerCC.Initiate(ProxyInclusion)`,
+		);
+		// createAPI(... , false) skips support check — the primary always
+		// implements this CC even if its NIF doesn't advertise it explicitly.
+		const api = primary.createAPI(
+			CommandClasses["Inclusion Controller"],
+			false,
+		);
+		await api.initiateStep(
+			newNodeId,
+			InclusionControllerStep.ProxyInclusion,
+		);
+		this.driver.controllerLog.print(
+			`bridge: Initiate sent — primary should now begin its node-add flow for ${newNodeId}`,
+		);
+	}
+
 	private async handleSendSlaveNodeInfoCallback(
 		msg: VirtualNodeSendNodeInfoCallback,
 	): Promise<boolean> {
