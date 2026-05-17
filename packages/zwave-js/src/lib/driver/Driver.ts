@@ -2408,6 +2408,35 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		this.driverLog.print("driver ready");
 		this.emit("driver ready");
 
+		// Phase 4 prototype: one-shot virtual-node inclusion trigger via env var.
+		// Set ZWAVE_JS_PROTOTYPE_INCLUDE_VIRTUAL=dimmer (or binary), restart the
+		// driver, then trigger "Add Node" on the primary controller. Logs every
+		// callback the SDK firmware reports back, so we can observe whether
+		// S2 KEX is handled internally or has to be implemented host-side.
+		const protoProfile = process.env.ZWAVE_JS_PROTOTYPE_INCLUDE_VIRTUAL;
+		if (protoProfile === "dimmer" || protoProfile === "binary") {
+			void (async () => {
+				try {
+					this.controllerLog.print(
+						`PROTOTYPE: starting virtual-node inclusion (profile=${protoProfile}) — trigger Add Node on the primary controller now`,
+					);
+					const cb = await this._controller!.beginAddingVirtualNode(
+						protoProfile,
+					);
+					this.controllerLog.print(
+						`PROTOTYPE: virtual-node inclusion DONE — newNodeId=${cb.newNodeId} originalNodeId=${cb.originalNodeId}`,
+					);
+				} catch (e) {
+					this.controllerLog.print(
+						`PROTOTYPE: virtual-node inclusion FAILED: ${
+							e instanceof Error ? e.message : String(e)
+						}`,
+						"error",
+					);
+				}
+			})();
+		}
+
 		// Add event handlers for the nodes
 		for (const node of this._controller.nodes.values()) {
 			this.addNodeEventHandlers(node);

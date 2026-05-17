@@ -264,6 +264,14 @@ import {
 	SetApplicationNodeInformationRequest,
 	type SetLearnModeCallback,
 	SetLearnModeRequest,
+	SetSlaveLearnModeCallback,
+	SetSlaveLearnModeRequest,
+	type SetSlaveLearnModeResponse,
+	SlaveLearnMode,
+	SlaveLearnModeStatus,
+	IsVirtualNodeRequest,
+	type IsVirtualNodeResponse,
+	VirtualNodeSetNodeInfoRequest,
 	SetLongRangeChannelRequest,
 	type SetLongRangeChannelResponse,
 	SetPriorityRouteRequest,
@@ -312,6 +320,10 @@ import type { StatisticsEventCallbacks } from "../driver/Statistics.js";
 import { type TaskBuilder, TaskPriority } from "../driver/Task.js";
 import { DeviceClass } from "../node/DeviceClass.js";
 import { ZWaveNode } from "../node/Node.js";
+import {
+	profileNIF,
+	type VirtualHostedNodeProfile,
+} from "../node/VirtualHostedNode.js";
 import { VirtualNode } from "../node/VirtualNode.js";
 import {
 	InterviewStage,
@@ -431,6 +443,10 @@ export class ZWaveController
 		driver.registerRequestHandler(
 			FunctionType.SetLearnMode,
 			this.handleLearnModeCallback.bind(this),
+		);
+		driver.registerRequestHandler(
+			FunctionType.VirtualNodeSetLearnMode,
+			this.handleSlaveLearnModeCallback.bind(this),
 		);
 	}
 
@@ -9565,6 +9581,194 @@ export class ZWaveController
 
 		// not sure what to do with this message
 		return false;
+	}
+
+	// ============================================================
+	// Phase 4 prototype: virtual-node inclusion
+	//
+	// The bridge feature lets the host advertise extra "virtual" end-nodes
+	// alongside the physical controller node, so other Z-Wave devices can
+	// associate with them as command targets. Inclusion of a virtual node
+	// is initiated here via SetSlaveLearnMode(Add); the *primary* controller
+	// elsewhere on the network drives the actual handshake.
+	//
+	// This is a prototype — the goal of the first iteration is to observe
+	// what the SDK firmware reports back through the bridge serial-API
+	// callbacks so we can decide whether S2 KEX is handled internally or
+	// has to be implemented host-side.
+	// ============================================================
+
+	private _pendingVirtualNodeInclusion?: {
+		profile: VirtualHostedNodeProfile;
+		resolve: (cb: SetSlaveLearnModeCallback) => void;
+		reject: (e: Error) => void;
+		startedAt: number;
+		callbacks: SetSlaveLearnModeCallback[];
+	};
+
+	public async beginAddingVirtualNode(
+		profile: VirtualHostedNodeProfile,
+	): Promise<SetSlaveLearnModeCallback> {
+		if (this._pendingVirtualNodeInclusion) {
+			throw new ZWaveError(
+				"A virtual-node inclusion is already in progress",
+				ZWaveErrorCodes.Controller_CommandError,
+			);
+		}
+		// Step 1: probe which slot IDs the radio recognizes as virtual. SiLabs
+		// 700/800-series radios typically reserve a small range of high node IDs
+		// for virtual slaves; we probe 232-239 as the standard SDK default.
+		this.driver.controllerLog.print(
+			`bridge: beginAddingVirtualNode(profile=${profile}) — probing virtual slot range 232-239`,
+		);
+		const virtualSlots: number[] = [];
+		for (let id = 232; id <= 239; id++) {
+			try {
+				const ivn = await this.driver.sendMessage<
+					IsVirtualNodeResponse
+				>(new IsVirtualNodeRequest({ nodeId: id }), {
+					supportCheck: false,
+				});
+				this.driver.controllerLog.print(
+					`bridge:   IsVirtualNode(${id}) = ${ivn.isVirtual}`,
+				);
+				if (ivn.isVirtual) virtualSlots.push(id);
+			} catch (e) {
+				this.driver.controllerLog.print(
+					`bridge:   IsVirtualNode(${id}) failed: ${
+						e instanceof Error ? e.message : String(e)
+					}`,
+					"warn",
+				);
+			}
+		}
+		this.driver.controllerLog.print(
+			`bridge: pre-allocated virtual slots = [${virtualSlots.join(", ")}]`,
+		);
+
+		// Step 2: install NIF for our chosen slot. If no slots are pre-allocated
+		// we optimistically try slot 232 anyway — some firmwares accept
+		// SetNodeInfo as the implicit allocation mechanism (the slot becomes
+		// virtual after SetNodeInfo succeeds).
+		const targetSlot = virtualSlots[0] ?? 232;
+		const nif = profileNIF(profile);
+		this.driver.controllerLog.print(
+			`bridge: SetNodeInfo(slot=${targetSlot}) generic=0x${
+				nif.genericDeviceClass.toString(16)
+			} specific=0x${
+				nif.specificDeviceClass.toString(16)
+			} supportedCCs=[${
+				nif.supportedCCs.map((c) => `0x${c.toString(16)}`).join(",")
+			}]`,
+		);
+		// Fire-and-forget: no Response is sent, so don't wait for one. Mirrors
+		// SetApplicationNodeInformationRequest (0x03) — radio ACKs and stores.
+		await this.driver.sendMessage(
+			new VirtualNodeSetNodeInfoRequest({
+				nodeId: targetSlot,
+				listening: true,
+				genericDeviceClass: nif.genericDeviceClass,
+				specificDeviceClass: nif.specificDeviceClass,
+				supportedCCs: nif.supportedCCs as readonly number[],
+			}),
+			{ supportCheck: false },
+		);
+		this.driver.controllerLog.print(
+			`bridge: SetNodeInfo ACKed by radio (fire-and-forget)`,
+		);
+
+		// Step 3: enable learn mode for that slot (passive wait — HA's primary
+		// has to initiate Add Node to drive the inclusion handshake).
+		this.driver.controllerLog.print(
+			`bridge: SetSlaveLearnMode(slot=${targetSlot}, Enable)`,
+		);
+		const result = await this.driver.sendMessage<SetSlaveLearnModeResponse>(
+			new SetSlaveLearnModeRequest({
+				nodeId: targetSlot,
+				mode: SlaveLearnMode.Enable,
+			}),
+		);
+		if (!result.success) {
+			throw new ZWaveError(
+				`Radio refused SetSlaveLearnMode(slot=${targetSlot}, Enable)`,
+				ZWaveErrorCodes.Controller_CommandError,
+			);
+		}
+		this.driver.controllerLog.print(
+			`bridge: radio accepted; awaiting Done callback — trigger Add Node on the primary controller now`,
+		);
+		return new Promise<SetSlaveLearnModeCallback>((resolve, reject) => {
+			this._pendingVirtualNodeInclusion = {
+				profile,
+				resolve,
+				reject,
+				startedAt: Date.now(),
+				callbacks: [],
+			};
+		});
+	}
+
+	public async stopAddingVirtualNode(): Promise<boolean> {
+		this.driver.controllerLog.print(
+			`bridge: stopAddingVirtualNode — sending SetSlaveLearnMode(Disable)`,
+		);
+		const result = await this.driver.sendMessage<SetSlaveLearnModeResponse>(
+			new SetSlaveLearnModeRequest({
+				nodeId: 0,
+				mode: SlaveLearnMode.Disable,
+			}),
+		);
+		if (this._pendingVirtualNodeInclusion) {
+			const p = this._pendingVirtualNodeInclusion;
+			this._pendingVirtualNodeInclusion = undefined;
+			p.reject(
+				new Error(
+					"Virtual-node inclusion cancelled via stopAddingVirtualNode",
+				),
+			);
+		}
+		return result.success;
+	}
+
+	private async handleSlaveLearnModeCallback(
+		msg: SetSlaveLearnModeCallback,
+	): Promise<boolean> {
+		this.driver.controllerLog.print(
+			`bridge: SetSlaveLearnModeCallback status=${
+				SlaveLearnModeStatus[msg.status] ?? msg.status
+			} originalNodeId=${msg.originalNodeId} newNodeId=${msg.newNodeId} callbackId=${msg.callbackId}`,
+		);
+		const pending = this._pendingVirtualNodeInclusion;
+		if (!pending) {
+			this.driver.controllerLog.print(
+				`bridge: SetSlaveLearnModeCallback received with no pending inclusion — ignoring`,
+				"warn",
+			);
+			return true;
+		}
+		pending.callbacks.push(msg);
+		if (msg.status === SlaveLearnModeStatus.Started) {
+			// keep waiting
+			return true;
+		}
+		this._pendingVirtualNodeInclusion = undefined;
+		if (msg.status === SlaveLearnModeStatus.Done) {
+			this.driver.controllerLog.print(
+				`bridge: virtual-node inclusion complete after ${
+					Date.now() - pending.startedAt
+				} ms — newNodeId=${msg.newNodeId}, ${pending.callbacks.length} callback(s) total`,
+			);
+			pending.resolve(msg);
+		} else {
+			pending.reject(
+				new Error(
+					`Virtual-node inclusion failed (status=${
+						SlaveLearnModeStatus[msg.status] ?? msg.status
+					})`,
+				),
+			);
+		}
+		return true;
 	}
 
 	private async expectSecurityBootstrapS0(
