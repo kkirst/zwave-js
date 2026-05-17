@@ -9750,27 +9750,37 @@ export class ZWaveController
 			return true;
 		}
 		pending.callbacks.push(msg);
-		if (msg.status === SlaveLearnModeStatus.Started) {
-			// keep waiting
-			return true;
-		}
-		this._pendingVirtualNodeInclusion = undefined;
-		if (msg.status === SlaveLearnModeStatus.Done) {
+
+		// Per SiLabs spec, AssignNodeIdDone (0x01) is the actual success
+		// signal — the NodeID is allocated and the virtual node exists in
+		// the radio's slot table. The 0x02-0x05 codes are post-allocation
+		// information / range-info phases the radio fires automatically;
+		// they're informational, not gating.
+		if (msg.status === SlaveLearnModeStatus.AssignNodeIdDone) {
+			this._pendingVirtualNodeInclusion = undefined;
 			this.driver.controllerLog.print(
-				`bridge: virtual-node inclusion complete after ${
+				`bridge: virtual-node ALLOCATED after ${
 					Date.now() - pending.startedAt
-				} ms — newNodeId=${msg.newNodeId}, ${pending.callbacks.length} callback(s) total`,
+				} ms — newNodeId=${msg.newNodeId}`,
 			);
 			pending.resolve(msg);
-		} else {
-			pending.reject(
-				new Error(
-					`Virtual-node inclusion failed (status=${
-						SlaveLearnModeStatus[msg.status] ?? msg.status
-					})`,
-				),
-			);
+			return true;
 		}
+		if (msg.status === SlaveLearnModeStatus.Failed) {
+			this._pendingVirtualNodeInclusion = undefined;
+			pending.reject(
+				new Error(`Virtual-node inclusion failed (status=Failed)`),
+			);
+			return true;
+		}
+		// 0x02-0x05 informational stages — log and keep waiting (though we
+		// already resolved above; this only fires if the radio sends them
+		// before AssignNodeIdDone, which would be unusual).
+		this.driver.controllerLog.print(
+			`bridge: informational callback status=${
+				SlaveLearnModeStatus[msg.status] ?? `0x${msg.status.toString(16)}`
+			} — continuing to wait`,
+		);
 		return true;
 	}
 

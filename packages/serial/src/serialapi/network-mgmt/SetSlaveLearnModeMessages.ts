@@ -39,9 +39,20 @@ export enum SlaveLearnMode {
 	Remove = 0x03,
 }
 
+/**
+ * Status codes returned in the SetSlaveLearnMode callback. Per SiLabs
+ * INS13954 and OpenZWave Driver.cpp reference implementation, allocation
+ * SUCCESS is signaled by AssignNodeIdDone (0x01), at which point the
+ * callback payload's `newNodeId` field holds the assigned virtual slot.
+ * The 0x02-0x05 codes are informational stages of the post-allocation
+ * handshake; the radio fires them in sequence after AssignNodeIdDone.
+ */
 export enum SlaveLearnModeStatus {
-	Started = 0x01,
-	Done = 0x06,
+	AssignNodeIdDone = 0x01,
+	AssignRangeInfoUpdate = 0x02,
+	AssignNodeInfoPending = 0x03,
+	AssignNodeInfoTransmitted = 0x04,
+	AssignComplete = 0x05,
 	Failed = 0x07,
 }
 
