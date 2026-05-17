@@ -3613,6 +3613,16 @@ export class ZWaveController
 					}
 				}
 
+				// MISSING IN VANILLA: emit "node found" so external consumers
+				// (e.g. zwave-js-ui's _onNodeFound handler) populate their own
+				// tracking maps before the subsequent "node added" event fires.
+				// Without this emit, consumers' _addNode helpers see no
+				// existing entry, return undefined, and downstream property
+				// assignments crash. Mirrors what the sibling Replace case
+				// (handleInclusionControllerCCInitiateReplace) has done
+				// since proxy inclusion was added.
+				this.emit("node found", { id: newNode.id });
+
 				// Assume the device is alive
 				// If it is actually a sleeping device, it will be marked as such later
 				newNode.markAsAlive();
