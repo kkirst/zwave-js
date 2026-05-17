@@ -152,6 +152,7 @@ import {
 } from "@zwave-js/serial";
 import {
 	ApplicationUpdateRequest,
+	BridgeApplicationCommandRequest,
 	type CommandRequest,
 	type ContainsCC,
 	EnterBootloaderRequest,
@@ -231,6 +232,7 @@ import {
 import { DriverLogger } from "../log/Driver.js";
 import type { Endpoint } from "../node/Endpoint.js";
 import type { ZWaveNode } from "../node/Node.js";
+import { VirtualHostedNode } from "../node/VirtualHostedNode.js";
 import {
 	InterviewStage,
 	NodeStatus,
@@ -1067,6 +1069,20 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 	private awaitedCLIChunks: AwaitedCLIChunkEntry[] = [];
 	/** A list of promises waiting for the queues to become idle */
 	private awaitedIdle: AwaitedIdleEntry[] = [];
+
+	/**
+	 * Bridge Controller virtual end-nodes hosted by this controller. Keyed
+	 * by NodeID. When inbound frames arrive over the bridge serial-API path
+	 * addressed at one of these NodeIDs (parsed as
+	 * `BridgeApplicationCommandRequest` with `targetNodeId` matching), the
+	 * driver dispatches the CC to the virtual node's handler instead of to
+	 * the source physical node.
+	 *
+	 * Phase 2 (this commit): the map exists, dispatch hook works, but no
+	 * provisioning API yet — population happens via direct tests injecting
+	 * a `VirtualHostedNode` instance, or (Phase 4+) via the inclusion flow.
+	 */
+	public readonly virtualNodes = new Map<number, VirtualHostedNode>();
 
 	/** A map of Node ID -> ongoing sessions */
 	private nodeSessions = new Map<number, Sessions>();
@@ -5735,6 +5751,34 @@ ${handlers.length} left`,
 
 			// For further actions, we are only interested in the innermost CC
 			this.unwrapCommands(msg);
+
+			// Bridge Controller virtual end-node dispatch.
+			// A BridgeApplicationCommandRequest carries BOTH the source NodeID
+			// (`msg.getNodeId()` — the physical device that sent the frame)
+			// AND the destination NodeID (`msg.targetNodeId` — us, or one of
+			// our hosted virtual nodes). If the destination matches a
+			// VirtualHostedNode we host, route the CC there instead of to the
+			// source physical node — that's the bridge-mode contract. Skip
+			// for multicast frames (targetNodeId is an array) since virtual
+			// nodes don't currently participate in multicast destinations.
+			if (
+				this._controller != undefined
+				&& msg instanceof BridgeApplicationCommandRequest
+				&& typeof msg.targetNodeId === "number"
+				&& this.virtualNodes.has(msg.targetNodeId)
+			) {
+				const vn = this.virtualNodes.get(msg.targetNodeId)!;
+				const sourceNodeId = msg.getNodeId() ?? 0;
+				this.driverLog.print(
+					`bridge: dispatching ${
+						msg.command?.constructor.name ?? "?"
+					} from node ${sourceNodeId} to virtual node ${vn.id}`,
+				);
+				if (msg.command) {
+					await vn.handleCommand(sourceNodeId, msg.command);
+				}
+				return;
+			}
 
 			// cannot handle ApplicationCommandRequests without a controller
 			if (this._controller == undefined) {
