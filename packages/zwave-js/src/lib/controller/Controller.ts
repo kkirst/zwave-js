@@ -9677,25 +9677,28 @@ export class ZWaveController
 			`bridge: SetNodeInfo ACKed by radio (fire-and-forget)`,
 		);
 
-		// Step 3: enable learn mode for that slot (passive wait — HA's primary
-		// has to initiate Add Node to drive the inclusion handshake).
+		// Step 3: initiate ADD on our own authority. As of the 2026-05-17 SIS
+		// handover, the Pi is now SUC/SIS (Inclusion Controller) so per SiLabs
+		// INS13954 §4.6.2 we're permitted to use SLAVE_LEARN_MODE_ADD which
+		// allocates a slot and performs inclusion without needing an external
+		// primary in Add Node mode.
 		this.driver.controllerLog.print(
-			`bridge: SetSlaveLearnMode(slot=${targetSlot}, Enable)`,
+			`bridge: SetSlaveLearnMode(nodeId=0, Add) — Pi has SIS authority post-handover`,
 		);
 		const result = await this.driver.sendMessage<SetSlaveLearnModeResponse>(
 			new SetSlaveLearnModeRequest({
-				nodeId: targetSlot,
-				mode: SlaveLearnMode.Enable,
+				nodeId: 0,
+				mode: SlaveLearnMode.Add,
 			}),
 		);
 		if (!result.success) {
 			throw new ZWaveError(
-				`Radio refused SetSlaveLearnMode(slot=${targetSlot}, Enable)`,
+				`Radio refused SetSlaveLearnMode(0, Add) — verify Pi is still SIS`,
 				ZWaveErrorCodes.Controller_CommandError,
 			);
 		}
 		this.driver.controllerLog.print(
-			`bridge: radio accepted; awaiting Done callback — trigger Add Node on the primary controller now`,
+			`bridge: radio accepted ADD; awaiting Done callback with allocated NodeID…`,
 		);
 		return new Promise<SetSlaveLearnModeCallback>((resolve, reject) => {
 			this._pendingVirtualNodeInclusion = {

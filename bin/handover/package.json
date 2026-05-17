@@ -1,0 +1,9 @@
+{
+  "name": "handover-runner",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "zwave-js": "15.23.5"
+  }
+}
