@@ -2488,6 +2488,46 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			})();
 		}
 
+		// Phase 5 prototype: register an existing virtual node into the
+		// driver's virtualNodes map so BridgeApplicationCommand dispatch
+		// can route inbound frames to it. Without this, the radio's frames
+		// addressed to e.g. node 111 are ignored by the dispatch check
+		// in handleRequest. Format: ZWAVE_JS_PROTOTYPE_REGISTER_VIRTUAL=
+		// <nodeId>:<dimmer|binary>[,<nodeId>:<profile>,...]
+		const registerSpec = process.env.ZWAVE_JS_PROTOTYPE_REGISTER_VIRTUAL;
+		if (registerSpec) {
+			let added = 0;
+			for (const entry of registerSpec.split(",")) {
+				const [idStr, prof] = entry.split(":");
+				const nid = Number(idStr);
+				if (
+					Number.isInteger(nid) && nid > 0
+					&& (prof === "dimmer" || prof === "binary")
+				) {
+					const { VirtualHostedNode } = await import(
+						"../node/VirtualHostedNode.js"
+					);
+					this.virtualNodes.set(nid, new VirtualHostedNode(nid, prof));
+					added++;
+					this.controllerLog.print(
+						`PROTOTYPE: registered virtual node ${nid} (profile=${prof}) into driver registry`,
+					);
+				} else {
+					this.controllerLog.print(
+						`PROTOTYPE: invalid REGISTER_VIRTUAL entry "${entry}" — expected <nodeId>:<dimmer|binary>`,
+						"warn",
+					);
+				}
+			}
+			if (added > 0) {
+				// Persist immediately so a restart picks them up
+				await this.saveVirtualHostedNodes();
+				this.controllerLog.print(
+					`PROTOTYPE: ${added} virtual node(s) registered + persisted`,
+				);
+			}
+		}
+
 		// Phase 4b prototype: re-set NIF + re-notify for an EXISTING virtual
 		// node that was allocated before we had the proper NIF flow. Format:
 		// ZWAVE_JS_PROTOTYPE_FIX_NIF=<nodeId>:<dimmer|binary>
