@@ -187,8 +187,7 @@ export class VirtualHostedNode {
 	/**
 	 * Test/diagnostic hook: every command dispatched to this virtual node is
 	 * appended here so the integration test can assert "the dispatch
-	 * reached us". Phase 5 will replace this with a real value DB +
-	 * event-based reporting.
+	 * reached us". Kept around for the bridgeCommandToVirtualNode test.
 	 */
 	public readonly receivedCommands: Array<{
 		sourceNodeId: number;
@@ -196,12 +195,53 @@ export class VirtualHostedNode {
 		commandClass: number;
 	}> = [];
 
+	/**
+	 * The vnode's primary value — the canonical brightness/on-off state the
+	 * bridge daemon maintains. For dimmer profile: 0-99 (Z-Wave level scale)
+	 * or `undefined` until first set. For binary profile: boolean or
+	 * undefined. Mutated via `setValue`.
+	 *
+	 * This is intentionally simple compared to real ZWaveNode's full ValueDB
+	 * — virtual nodes serve one purpose (bulb-group state container) and
+	 * don't need the broader CC value-tree machinery.
+	 */
+	public currentValue: number | boolean | undefined;
+	public targetValue: number | boolean | undefined;
+
+	/**
+	 * Optional listener fired AFTER `setValue` mutates `currentValue`. The
+	 * driver wires this in `loadVirtualNodes` / `register` so it can emit
+	 * a "virtual node value updated" event for external consumers (the
+	 * @zwave-js/server WS event stream → bridge daemon subscribers).
+	 *
+	 * Kept as a single optional listener rather than an EventEmitter to keep
+	 * VirtualHostedNode dependency-light (no node:events import).
+	 */
+	public onValueChange?: (
+		nodeId: number,
+		previous: number | boolean | undefined,
+		current: number | boolean | undefined,
+	) => void;
+
 	public constructor(id: number, profile: VirtualHostedNodeProfile) {
 		this.id = id;
 		this.profile = profile;
 		this.nif = profileNIF(profile);
 		// Every virtual node starts with the standard Lifeline group.
 		this.associationGroups.set(1, DEFAULT_LIFELINE_GROUP);
+	}
+
+	/**
+	 * Mutate the vnode's value. Fires `onValueChange` so external subscribers
+	 * (e.g. the driver-level event stream) can observe and forward. Idempotent
+	 * — calling with the same value is a no-op (no event fired).
+	 */
+	public setValue(value: number | boolean | undefined): void {
+		if (this.currentValue === value) return;
+		const previous = this.currentValue;
+		this.currentValue = value;
+		this.targetValue = value;
+		this.onValueChange?.(this.id, previous, value);
 	}
 
 	public async handleCommand(

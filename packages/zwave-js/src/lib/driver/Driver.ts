@@ -1099,6 +1099,46 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		await saveVirtualNodes(this.cacheDir, this.virtualNodes.values());
 	}
 
+	/**
+	 * Register a VirtualHostedNode in the runtime map and wire its value-
+	 * change listener so mutations are observable on the Driver via the
+	 * "virtual node value updated" event. External consumers (e.g.
+	 * @zwave-js/server) subscribe to this and forward to clients.
+	 */
+	public registerVirtualHostedNode(vn: VirtualHostedNode): void {
+		this.virtualNodes.set(vn.id, vn);
+		vn.onValueChange = (nodeId, previous, current) => {
+			this.driverLog.print(
+				`bridge: virtual node ${nodeId} value: ${previous} → ${current}`,
+			);
+			// Emit a Driver-level event for external listeners. Untyped
+			// event channel; consumers cast in their handler.
+			(this as any).emit("virtual node value updated", {
+				nodeId,
+				previous,
+				current,
+			});
+		};
+	}
+
+	/**
+	 * Mutate a hosted virtual node's value. Convenience around
+	 * `VirtualHostedNode.setValue` that does the nodeId lookup. Fires the
+	 * "virtual node value updated" event if the value actually changes.
+	 */
+	public setVirtualHostedNodeValue(
+		nodeId: number,
+		value: number | boolean | undefined,
+	): void {
+		const vn = this.virtualNodes.get(nodeId);
+		if (!vn) {
+			throw new Error(
+				`setVirtualHostedNodeValue: node ${nodeId} is not a hosted virtual node`,
+			);
+		}
+		vn.setValue(value);
+	}
+
 	/** A map of Node ID -> ongoing sessions */
 	private nodeSessions = new Map<number, Sessions>();
 	private ensureNodeSessions(nodeId: number): Sessions {
@@ -1777,7 +1817,7 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			try {
 				const restored = await loadVirtualNodes(this.cacheDir);
 				for (const vn of restored) {
-					this.virtualNodes.set(vn.id, vn);
+					this.registerVirtualHostedNode(vn);
 				}
 				if (restored.length > 0) {
 					this.driverLog.print(
@@ -2507,7 +2547,9 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					const { VirtualHostedNode } = await import(
 						"../node/VirtualHostedNode.js"
 					);
-					this.virtualNodes.set(nid, new VirtualHostedNode(nid, prof));
+					this.registerVirtualHostedNode(
+						new VirtualHostedNode(nid, prof),
+					);
 					added++;
 					this.controllerLog.print(
 						`PROTOTYPE: registered virtual node ${nid} (profile=${prof}) into driver registry`,
