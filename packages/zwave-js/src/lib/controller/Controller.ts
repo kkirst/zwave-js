@@ -3,6 +3,7 @@ import {
 	AssociationCC,
 	type AssociationCheckResult,
 	type AssociationGroup,
+	type CommandClass,
 	ECDHProfiles,
 	FLiRS2WakeUpTime,
 	type FirmwareUpdateOptions,
@@ -265,6 +266,7 @@ import {
 	SetApplicationNodeInformationRequest,
 	type SetLearnModeCallback,
 	SetLearnModeRequest,
+	SendDataBridgeRequest,
 	SetSlaveLearnModeCallback,
 	SetSlaveLearnModeRequest,
 	type SetSlaveLearnModeResponse,
@@ -9673,6 +9675,49 @@ export class ZWaveController
 		startedAt: number;
 		callbacks: SetSlaveLearnModeCallback[];
 	};
+
+	/**
+	 * Sends a CC frame from a hosted virtual slave to a destination node on
+	 * the mesh. Phase 6 capability — needed for the paddle-LED-follows-vnode
+	 * use case (vnode value change → push MultilevelSwitchCC.Report to
+	 * paddle's dimmer endpoint so its LED bar updates).
+	 *
+	 * Uses the existing SendDataBridge serial-API (0xA9) with sourceNodeId
+	 * set to the virtual node's ID — no new message class needed, the
+	 * `sourceNodeId` parameter on SendDataBridgeRequest already lets us
+	 * override the default (controller's ownNodeId).
+	 *
+	 * S2 wire-encryption considerations: virtual nodes share the radio's
+	 * network keys (Pi joined the mesh at S2_AccessControl which grants
+	 * the lower S2 classes too). Frames emitted as virtual node ID will
+	 * be encrypted with whatever class the destination supports —
+	 * destination decrypts using its own copy of the network key.
+	 *
+	 * NOT YET INTEGRATED with auto-encapsulation. Caller is responsible for
+	 * supplying a complete CommandClass with destination nodeId set.
+	 * Encapsulation (Security2, Supervision, etc.) can be layered later.
+	 */
+	public async sendCommandFromVirtualNode(
+		vnodeId: number,
+		command: CommandClass,
+	): Promise<void> {
+		if (!this.driver.virtualNodes.has(vnodeId)) {
+			throw new ZWaveError(
+				`Cannot send from node ${vnodeId} — not a hosted virtual node`,
+				ZWaveErrorCodes.Controller_NodeNotFound,
+				vnodeId,
+			);
+		}
+		this.driver.controllerLog.print(
+			`bridge: sendCommandFromVirtualNode(vnode=${vnodeId} → dest=${command.nodeId}) — ${command.constructor.name}`,
+		);
+		const msg = new SendDataBridgeRequest({
+			sourceNodeId: vnodeId,
+			command: command as any,
+			maxSendAttempts: 1,
+		});
+		await this.driver.sendMessage(msg);
+	}
 
 	/**
 	 * Installs the dimmer/binary profile NIF for an already-allocated virtual

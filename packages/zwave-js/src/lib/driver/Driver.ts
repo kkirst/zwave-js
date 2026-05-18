@@ -2528,6 +2528,54 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			}
 		}
 
+		// Phase 6 prototype: send a CC from a hosted virtual slave to a
+		// destination node, validating the SendDataBridge outbound path.
+		// Format: ZWAVE_JS_PROTOTYPE_SEND_FROM_VNODE=<srcVnodeId>:<destNodeId>
+		// e.g. ZWAVE_JS_PROTOTYPE_SEND_FROM_VNODE=111:71
+		// Sends a NoOperationCC (simplest possible frame) — if the destination
+		// ACKs, we know the wire-level send-as-virtual-node works.
+		const sendFromVnode = process.env.ZWAVE_JS_PROTOTYPE_SEND_FROM_VNODE;
+		if (sendFromVnode) {
+			const [srcStr, destStr] = sendFromVnode.split(":");
+			const src = Number(srcStr);
+			const dest = Number(destStr);
+			if (
+				Number.isInteger(src) && src > 0
+				&& Number.isInteger(dest) && dest > 0
+			) {
+				void (async () => {
+					try {
+						this.controllerLog.print(
+							`PROTOTYPE: sending NoOperationCC from vnode ${src} → node ${dest}…`,
+						);
+						const cc = new NoOperationCC({
+							nodeId: dest,
+							endpointIndex: 0,
+						});
+						await this._controller!.sendCommandFromVirtualNode(
+							src,
+							cc,
+						);
+						this.controllerLog.print(
+							`PROTOTYPE: send-from-vnode complete (no error returned)`,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`PROTOTYPE: send-from-vnode FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"error",
+						);
+					}
+				})();
+			} else {
+				this.controllerLog.print(
+					`PROTOTYPE: invalid ZWAVE_JS_PROTOTYPE_SEND_FROM_VNODE=${sendFromVnode}; expected <srcVnodeId>:<destNodeId>`,
+					"warn",
+				);
+			}
+		}
+
 		// Phase 4b prototype: re-set NIF + re-notify for an EXISTING virtual
 		// node that was allocated before we had the proper NIF flow. Format:
 		// ZWAVE_JS_PROTOTYPE_FIX_NIF=<nodeId>:<dimmer|binary>
