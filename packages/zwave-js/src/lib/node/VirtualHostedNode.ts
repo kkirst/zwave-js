@@ -452,14 +452,29 @@ export class VirtualHostedNode {
 			: Math.max(0, Math.min(99, Math.round(value)));
 		// Late-import to avoid a top-level cycle with @zwave-js/cc.
 		const ccMod: any = await import("@zwave-js/cc/MultilevelSwitchCC");
+		const mcMod: any = await import("@zwave-js/cc/MultiChannelCC");
 		await Promise.allSettled(
 			members.map((m) => {
-				const cc = new ccMod.MultilevelSwitchCCSet({
+				const inner = new ccMod.MultilevelSwitchCCSet({
 					nodeId: m.nodeId,
-					endpointIndex: m.endpoint ?? 0,
+					endpointIndex: 0,
 					targetValue,
 					duration: 0,
 				});
+				// Endpoint > 0 targets must be MultiChannelCC-encapsulated.
+				// `sendCommandFromVirtualNode` doesn't auto-wrap, so without
+				// this the frame lands at the destination's root endpoint —
+				// observed 2026-05-19 to make a Zooz ZEN30's relay toggle on
+				// every dimmer Set because root endpoint mirrors a combined
+				// view across both endpoints.
+				const cc = m.endpoint != null && m.endpoint > 0
+					? new mcMod.MultiChannelCCCommandEncapsulation({
+						nodeId: m.nodeId,
+						endpointIndex: 0,
+						encapsulated: inner,
+						destination: m.endpoint,
+					})
+					: inner;
 				return this.sender!(this.id, cc);
 			}),
 		);
@@ -499,13 +514,22 @@ export class VirtualHostedNode {
 		const members = this.associations.get(BINARY_SET_GROUP_ID);
 		if (members == null || members.length === 0) return;
 		const ccMod: any = await import("@zwave-js/cc/BinarySwitchCC");
+		const mcMod: any = await import("@zwave-js/cc/MultiChannelCC");
 		await Promise.allSettled(
 			members.map((m) => {
-				const cc = new ccMod.BinarySwitchCCSet({
+				const inner = new ccMod.BinarySwitchCCSet({
 					nodeId: m.nodeId,
-					endpointIndex: m.endpoint ?? 0,
+					endpointIndex: 0,
 					targetValue: value,
 				});
+				const cc = m.endpoint != null && m.endpoint > 0
+					? new mcMod.MultiChannelCCCommandEncapsulation({
+						nodeId: m.nodeId,
+						endpointIndex: 0,
+						encapsulated: inner,
+						destination: m.endpoint,
+					})
+					: inner;
 				return this.sender!(this.id, cc);
 			}),
 		);
