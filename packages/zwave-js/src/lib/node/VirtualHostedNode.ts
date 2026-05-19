@@ -118,6 +118,11 @@ export const PROFILE_DIMMER: VirtualHostedNodeNIF = {
 	supportedCCs: [
 		CommandClasses.Basic,
 		CommandClasses["Multilevel Switch"],
+		// Binary Switch advertised alongside Multilevel so the vnode can act
+		// as a virtual relay (group 3 → paddle EP2) AND a virtual dimmer
+		// (group 2 → paddle EP1 LED). Mirrors how a ZEN30 paddle exposes
+		// both endpoints from a single physical device.
+		CommandClasses["Binary Switch"],
 		CommandClasses.Association,
 		CommandClasses["Multi Channel Association"],
 		CommandClasses["Association Group Information"],
@@ -185,6 +190,27 @@ export const DEFAULT_MULTILEVEL_SET_GROUP: VirtualHostedAssociationGroup = {
 
 /** Group ID for the MultilevelSwitch Set Group. */
 export const MULTILEVEL_SET_GROUP_ID = 2;
+
+/**
+ * Group 3 on every dimmer-profile vnode: "BinarySwitch Set Group". Members
+ * receive `BinarySwitchCC.Set` whenever the vnode's `currentBinaryValue`
+ * changes (driven by the bridge daemon's power state machine via
+ * `setBinaryValue`).
+ *
+ * Mirrors group 2's pattern but for the binary CC, enabling the vnode to
+ * act as a "virtual relay": users add the paddle's relay endpoint (EP2 on
+ * a ZEN30) to this group via HA's zwave-js-ui frontend; the vnode pushes
+ * binary Sets to it on every state-machine transition that opens or closes
+ * the relay.
+ */
+export const DEFAULT_BINARY_SET_GROUP: VirtualHostedAssociationGroup = {
+	label: "BinarySwitch Set Group",
+	maxNodes: 5,
+	isLifeline: false,
+};
+
+/** Group ID for the BinarySwitch Set Group. */
+export const BINARY_SET_GROUP_ID = 3;
 
 /** Persistence schema version. Bump on incompatible format changes. */
 const PERSISTENCE_VERSION = 1;
@@ -271,6 +297,22 @@ export class VirtualHostedNode {
 	public targetValue: number | boolean | undefined;
 
 	/**
+	 * Virtual-relay state, separate from `currentValue` (which is the dimmer
+	 * level). `true` = relay closed (bulbs powered); `false` = relay open
+	 * (bulbs unpowered); `undefined` = never set. Mutated via
+	 * `setBinaryValue`.
+	 *
+	 * The two values are decoupled on purpose: the bridge daemon's power
+	 * state machine drives `currentBinaryValue` (matter intent →
+	 * relay open/close), while the matter mirror drives `currentValue`
+	 * (matter brightness slider → LED feedback). A bulb's brightness can
+	 * be 99 even while the relay is open — the LED reflects matter intent;
+	 * the actual bulbs simply aren't powered yet.
+	 */
+	public currentBinaryValue: boolean | undefined;
+	public targetBinaryValue: boolean | undefined;
+
+	/**
 	 * Optional listener fired AFTER `setValue` mutates `currentValue`. The
 	 * driver wires this in `loadVirtualNodes` / `register` so it can emit
 	 * a "virtual node value updated" event for external consumers (the
@@ -283,6 +325,18 @@ export class VirtualHostedNode {
 		nodeId: number,
 		previous: number | boolean | undefined,
 		current: number | boolean | undefined,
+	) => void;
+
+	/**
+	 * Optional listener fired AFTER `setBinaryValue` mutates
+	 * `currentBinaryValue`. Mirrors `onValueChange` but for the binary
+	 * relay state. The driver wires this to emit a distinct
+	 * "virtual node binary value updated" event for external consumers.
+	 */
+	public onBinaryValueChange?: (
+		nodeId: number,
+		previous: boolean | undefined,
+		current: boolean | undefined,
 	) => void;
 
 	/**
@@ -334,6 +388,15 @@ export class VirtualHostedNode {
 			MULTILEVEL_SET_GROUP_ID,
 			DEFAULT_MULTILEVEL_SET_GROUP,
 		);
+		// Group 3 only exists on dimmer-profile vnodes (which advertise both
+		// MultilevelSwitch and BinarySwitch CCs). On a pure binary-profile
+		// vnode, the binary CC sits on group 2 instead.
+		if (profile === "dimmer") {
+			this.associationGroups.set(
+				BINARY_SET_GROUP_ID,
+				DEFAULT_BINARY_SET_GROUP,
+			);
+		}
 	}
 
 	/**
@@ -396,6 +459,52 @@ export class VirtualHostedNode {
 					endpointIndex: m.endpoint ?? 0,
 					targetValue,
 					duration: 0,
+				});
+				return this.sender!(this.id, cc);
+			}),
+		);
+	}
+
+	/**
+	 * Mutate the vnode's binary state AND auto-broadcast `BinarySwitchCC.Set`
+	 * to every member of the BinarySwitch Set Group (group 3). Used by the
+	 * bridge daemon's power state machine to drive the paddle relay open
+	 * or closed.
+	 *
+	 * Mirrors `setValue` exactly but for the binary CC. Idempotent.
+	 */
+	public async setBinaryValue(value: boolean | undefined): Promise<void> {
+		if (this.currentBinaryValue === value) return;
+		const previous = this.currentBinaryValue;
+		this.currentBinaryValue = value;
+		this.targetBinaryValue = value;
+		this.onBinaryValueChange?.(this.id, previous, value);
+		await this._broadcastBinaryValueChange(value);
+	}
+
+	/**
+	 * Iterate the BinarySwitch Set Group's members and dispatch a
+	 * `BinarySwitchCC.Set` to each. Used by `setBinaryValue`.
+	 *
+	 * Only runs for dimmer-profile vnodes (binary-profile vnodes use
+	 * group 2 instead and go through `setValue`). Members with no endpoint
+	 * default to root (0); endpoint-aware members route via MultiChannel.
+	 */
+	private async _broadcastBinaryValueChange(
+		value: boolean | undefined,
+	): Promise<void> {
+		if (this.sender == null) return;
+		if (value == null) return;
+		if (this.profile !== "dimmer") return;
+		const members = this.associations.get(BINARY_SET_GROUP_ID);
+		if (members == null || members.length === 0) return;
+		const ccMod: any = await import("@zwave-js/cc/BinarySwitchCC");
+		await Promise.allSettled(
+			members.map((m) => {
+				const cc = new ccMod.BinarySwitchCCSet({
+					nodeId: m.nodeId,
+					endpointIndex: m.endpoint ?? 0,
+					targetValue: value,
 				});
 				return this.sender!(this.id, cc);
 			}),
@@ -602,6 +711,8 @@ export class VirtualHostedNode {
 						? AssociationGroupInfoProfile["General: Lifeline"]
 						: gid === MULTILEVEL_SET_GROUP_ID
 						? AssociationGroupInfoProfile["Control: Key 01"]
+						: gid === BINARY_SET_GROUP_ID
+						? AssociationGroupInfoProfile["Control: Key 01"]
 						: AssociationGroupInfoProfile["General: N/A"];
 					return {
 						groupId: gid,
@@ -640,6 +751,11 @@ export class VirtualHostedNode {
 				} else {
 					commands.set(CommandClasses["Binary Switch"], [0x01]);
 				}
+			} else if (command.groupId === BINARY_SET_GROUP_ID) {
+				// Group 3 issues BinarySwitch.Set — used by dimmer-profile
+				// vnodes acting as virtual relays. Pure binary-profile
+				// vnodes don't define group 3.
+				commands.set(CommandClasses["Binary Switch"], [0x01]); // Set
 			}
 			return new AssociationGroupInfoCCCommandListReport({
 				...addr,
@@ -906,6 +1022,19 @@ export class VirtualHostedNode {
 		node.associationGroups.clear();
 		for (const [gid, info] of Object.entries(data.associationGroups)) {
 			node.associationGroups.set(Number(gid), { ...info });
+		}
+		// Forward-compat backfill: vnodes persisted before group 3 existed
+		// don't have it on disk. Re-add the default BinarySwitch Set Group
+		// for dimmer-profile vnodes so the virtual relay capability is
+		// available immediately without manual cache migration.
+		if (
+			data.profile === "dimmer" &&
+			!node.associationGroups.has(BINARY_SET_GROUP_ID)
+		) {
+			node.associationGroups.set(
+				BINARY_SET_GROUP_ID,
+				DEFAULT_BINARY_SET_GROUP,
+			);
 		}
 		for (const [gid, members] of Object.entries(data.associations)) {
 			node.associations.set(

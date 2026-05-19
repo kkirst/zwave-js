@@ -1206,6 +1206,24 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		vn.setValue(value);
 	}
 
+	/**
+	 * Mutate a hosted virtual node's BINARY value (virtual-relay state) AND
+	 * auto-broadcast `BinarySwitchCC.Set` to group 3 members. Convenience
+	 * around `VirtualHostedNode.setBinaryValue` that does the nodeId lookup.
+	 */
+	public setVirtualHostedNodeBinaryValue(
+		nodeId: number,
+		value: boolean | undefined,
+	): void {
+		const vn = this.virtualNodes.get(nodeId);
+		if (!vn) {
+			throw new Error(
+				`setVirtualHostedNodeBinaryValue: node ${nodeId} is not a hosted virtual node`,
+			);
+		}
+		vn.setBinaryValue(value);
+	}
+
 	/** A map of Node ID -> ongoing sessions */
 	private nodeSessions = new Map<number, Sessions>();
 	private ensureNodeSessions(nodeId: number): Sessions {
