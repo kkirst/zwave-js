@@ -9772,6 +9772,87 @@ export class ZWaveController
 			vn.sm2 && destExpectsS2 && !isBareS2Protocol
 			&& typeof command.nodeId === "number"
 		) {
+			// Phase 4d (mesh-side S2 bootstrap): if vnode.sm2 has no SPAN
+			// state with this destination, we can't add a SPANExtension
+			// (maybeAddSPANExtension throws Security2CC_NoSPAN). Send a
+			// NonceGet from vnode → dest first; the destination's NonceReport
+			// reply arrives back at our radio as a frame addressed to the
+			// vnode, gets routed through vn.sm2 by the parsing-context
+			// override (Driver.ts), and storeRemoteEI populates spanTable
+			// for this peer. Then the encrypted Set's serialize() sees
+			// state=RemoteEI, generates senderEI, initializeSPAN, and emits
+			// the frame with SPAN extension.
+			const sm2Any: any = vn.sm2;
+			const isUsableState = () => {
+				const s = sm2Any.spanTable?.get(command.nodeId)?.type;
+				// SPANState enum (Manager2Types.ts): None=0, RemoteEI=1,
+				// LocalEI=2, SPAN=3. maybeAddSPANExtension at serialize-time
+				// is happy with RemoteEI (it'll generate our senderEI and
+				// initializeSPAN) or SPAN (already established). It throws
+				// NoSPAN for None or LocalEI.
+				return s === 1 || s === 3;
+			};
+			if (!isUsableState()) {
+				// Bidirectional NonceGet race: paddle may also send its own
+				// NonceGet (asking us for our nonce), which triggers
+				// vn.sm2.generateNonce and resets state to LocalEI even if
+				// paddle's NonceReport already arrived and put us at
+				// RemoteEI. Retry the dance a few times so we eventually
+				// settle to RemoteEI (paddle's NonceReport landing AFTER its
+				// NonceGet leaves state at RemoteEI rather than LocalEI).
+				const sendNonceGet = async () => {
+					try {
+						const nonceGet = new Security2CCNonceGet({
+							nodeId: command.nodeId as number,
+							endpointIndex: 0,
+						});
+						const ngMsg = new SendDataBridgeRequest({
+							sourceNodeId: vnodeId,
+							command: nonceGet as any,
+							maxSendAttempts: 1,
+						});
+						await this.driver.sendMessage(ngMsg);
+					} catch (err) {
+						this.driver.controllerLog.print(
+							`bridge: vnode ${vn.id} bootstrap NonceGet to ${command.nodeId} failed: ${
+								(err as Error)?.message ?? err
+							}`,
+							"warn",
+						);
+					}
+				};
+				const maxAttempts = 3;
+				for (let i = 0; i < maxAttempts && !isUsableState(); i++) {
+					const initial = sm2Any.spanTable?.get(command.nodeId)?.type
+						?? "none";
+					this.driver.controllerLog.print(
+						`bridge: vnode ${vn.id} bootstrap attempt ${
+							i + 1
+						}/${maxAttempts} to ${command.nodeId} (state=${initial})`,
+					);
+					await sendNonceGet();
+					const deadline = Date.now() + 700;
+					while (Date.now() < deadline) {
+						await new Promise((resolve) => setTimeout(resolve, 50));
+						if (isUsableState()) break;
+					}
+				}
+				const after = sm2Any.spanTable?.get(command.nodeId)?.type;
+				this.driver.controllerLog.print(
+					`bridge: vnode ${vn.id} post-NonceGet SPAN state for ${command.nodeId} = ${
+						after ?? "still none"
+					}`,
+				);
+				if (!isUsableState()) {
+					this.driver.controllerLog.print(
+						`bridge: vnode ${vn.id} → ${command.nodeId} skipped — SPAN bootstrap did not settle (last state=${
+							after ?? "none"
+						})`,
+						"warn",
+					);
+					return;
+				}
+			}
 			// Wrap with the class our vnode was granted (proxyBootstrap
 			// grants S2_Authenticated). Both ends know this key — the vnode
 			// because we cloned all network keys into its SM2, the

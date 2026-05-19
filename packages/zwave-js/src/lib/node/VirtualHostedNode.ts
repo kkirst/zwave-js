@@ -718,7 +718,28 @@ export class VirtualHostedNode {
 		// Driver dispatch path).
 		if (command instanceof Security2CCNonceGet) {
 			if (this.sm2 == null) return undefined;
-			const nonce = await this.sm2.generateNonce(sourceNodeId);
+			// Phase 4d: reply with a fresh receiverEI BUT preserve any
+			// existing spanTable[peer] state (typically RemoteEI from a
+			// just-arrived NonceReport in response to our own outbound
+			// NonceGet). If we called sm2.generateNonce(sourceNodeId) here,
+			// it would overwrite RemoteEI back to LocalEI and break the
+			// outbound encryption serialize path. We trade away the ability
+			// to decrypt encrypted frames FROM this peer to us (paddle→vnode),
+			// which is fine for the LED-feedback use case where the only
+			// secure traffic is vnode→paddle MultilevelSwitch.Set broadcasts.
+			const sm2Any = this.sm2 as any;
+			const preExisting = sm2Any.spanTable?.get(sourceNodeId);
+			const nonce = await sm2Any.generateNonce(sourceNodeId);
+			// Restore the prior state if we just clobbered RemoteEI/SPAN.
+			// SPANState enum (Manager2Types.ts): None=0, RemoteEI=1,
+			// LocalEI=2, SPAN=3.
+			if (
+				preExisting != null
+				&& (preExisting.type === 1 /* RemoteEI */
+					|| preExisting.type === 3 /* SPAN */)
+			) {
+				sm2Any.spanTable.set(sourceNodeId, preExisting);
+			}
 			return new Security2CCNonceReport({
 				...addr,
 				SOS: true,
