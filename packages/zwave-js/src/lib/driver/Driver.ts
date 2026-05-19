@@ -2748,6 +2748,38 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			}
 		}
 
+		// Phase 5c repair: re-set the radio's NIF slot for every restored
+		// virtual node. The radio's per-slot NIF table resets on driver
+		// init (observed 2026-05-19: vnode 144's slot went to
+		// {basic:3, generic:0, specific:0} after a restart, which then
+		// poisoned HA's interview cache on the next primary-notify
+		// heartbeat). Phase 4b's auto-setVirtualNodeNIF only fires
+		// during INITIAL inclusion; this restores the missing
+		// restart-time half. Fire-and-forget — failures are logged but
+		// don't block driver startup.
+		if (this.virtualNodes.size > 0) {
+			void (async () => {
+				for (const [vnId, vn] of this.virtualNodes) {
+					try {
+						await this._controller!.setVirtualNodeNIF(
+							vnId,
+							vn.profile,
+						);
+						this.controllerLog.print(
+							`vnode ${vnId}: NIF slot refreshed on driver init (profile=${vn.profile})`,
+						);
+					} catch (e) {
+						this.controllerLog.print(
+							`vnode ${vnId}: setVirtualNodeNIF on restore FAILED: ${
+								e instanceof Error ? e.message : String(e)
+							}`,
+							"warn",
+						);
+					}
+				}
+			})();
+		}
+
 		// Phase 4b prototype: advertise an EXISTING virtual node's NIF to HA.
 		// Set ZWAVE_JS_PROTOTYPE_ADVERTISE=<srcNodeId> to push that node's NIF
 		// to HA (NodeID 1). Use after a successful ADD to make HA learn about
