@@ -22,6 +22,9 @@ cd "$(dirname "$0")/.."
 
 COMPOSE="/opt/home-assistant/docker-compose.yaml"
 OVERRIDE="/opt/home-assistant/docker-compose.override.yaml"
+# Both files must be explicitly listed when invoking docker compose with -f;
+# auto-loading of *.override.yaml does NOT happen when -f is used.
+COMPOSE_ARGS=(-f "$COMPOSE" -f "$OVERRIDE")
 
 step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 
@@ -59,14 +62,14 @@ fi
 
 step "apply (restart vs force-recreate)"
 if [ "$RECREATE" = 1 ]; then
-  docker compose -f "$COMPOSE" up -d --force-recreate zwave-js-ui
+  docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate --no-deps zwave-js-ui
 else
-  docker compose -f "$COMPOSE" restart zwave-js-ui
+  docker compose "${COMPOSE_ARGS[@]}" restart zwave-js-ui
 fi
 sleep 4
 
 step "verify container is up + mounts in place"
-docker compose -f "$COMPOSE" ps zwave-js-ui
+docker compose "${COMPOSE_ARGS[@]}" ps zwave-js-ui
 docker inspect zwave-js-ui --format '{{range .Mounts}}{{.Source}} → {{.Destination}}{{println}}{{end}}' | grep zwave-js-dev | sed 's/^/  /'
 
 step "tail the first few lines of HA's zwave-js-ui log"

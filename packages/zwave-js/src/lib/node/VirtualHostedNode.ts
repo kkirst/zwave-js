@@ -1,7 +1,47 @@
-import { type CommandClass } from "@zwave-js/cc";
+import {
+	AssociationCCGet,
+	AssociationCCRemove,
+	AssociationCCReport,
+	AssociationCCSet,
+	AssociationCCSupportedGroupingsGet,
+	AssociationCCSupportedGroupingsReport,
+	AssociationGroupInfoCCCommandListGet,
+	AssociationGroupInfoCCCommandListReport,
+	AssociationGroupInfoCCInfoGet,
+	AssociationGroupInfoCCInfoReport,
+	AssociationGroupInfoCCNameGet,
+	AssociationGroupInfoCCNameReport,
+	AssociationGroupInfoProfile,
+	type CommandClass,
+	ManufacturerSpecificCCGet,
+	ManufacturerSpecificCCReport,
+	MultiChannelAssociationCCGet,
+	MultiChannelAssociationCCRemove,
+	MultiChannelAssociationCCReport,
+	MultiChannelAssociationCCSet,
+	MultiChannelAssociationCCSupportedGroupingsGet,
+	MultiChannelAssociationCCSupportedGroupingsReport,
+	MultiChannelCCEndPointGet,
+	MultiChannelCCEndPointReport,
+	NoOperationCC,
+	Security2CCCommandsSupportedGet,
+	Security2CCCommandsSupportedReport,
+	Security2CCNonceGet,
+	Security2CCNonceReport,
+	VersionCCCommandClassGet,
+	VersionCCCommandClassReport,
+	VersionCCGet,
+	VersionCCReport,
+	ZWavePlusCCGet,
+	ZWavePlusCCReport,
+	ZWavePlusNodeType,
+	ZWavePlusRoleType,
+} from "@zwave-js/cc";
 import {
 	CommandClasses,
-	type SecurityClass,
+	SecurityClass,
+	SecurityManager2,
+	ZWaveLibraryTypes,
 	getCCName,
 } from "@zwave-js/core";
 
@@ -61,17 +101,15 @@ const SPECIFIC_DEVICE_CLASS_BINARY_POWER_SWITCH = 0x01;
  * The "Multilevel Dimmer Plus" profile. CCs cover: paddle dim/level reports
  * (MultilevelSwitch + Basic), management (Association + Multi Channel
  * Association + Association Group Info), interrogation (Version + Z-Wave
- * Plus Info + Manufacturer Specific).
+ * Plus Info + Manufacturer Specific), plus Security 0/2.
  *
- * Note: Security and Security 2 are intentionally OMITTED. A virtual slave
- * hosted on the bridge controller can't truly participate in S2 KEX with
- * other primaries (no shared key material), and advertising S2 support
- * causes those primaries to attempt KEX, then hit an unhandled-rejection
- * crash in their proxyBootstrap path. Paddles associating to this node
- * still encrypt their own outbound commands with the network's S2 keys —
- * the radio (which holds those keys via the SIS) decrypts on the virtual
- * slave's behalf. So omitting S2 from the NIF only skips KEX, not actual
- * over-the-wire encryption.
+ * Security CCs are advertised so HA stores correct NodeProtocolInfo for the
+ * vnode AND so the proxyBootstrap KEX-failure fallback (Controller.ts) can
+ * trigger and grant S2_Authenticated via proxy-bridge trust. Without S2 in
+ * the NIF, HA stores wrong NodeProtocolInfo (isListening=false, etc); with
+ * S2 in NIF + KEX-failure fallback, both correct NodeProtocolInfo AND
+ * S2_Authenticated grant happen. The vnode never needs to actually decrypt
+ * S2 frames at the application layer — the radio handles it.
  */
 export const PROFILE_DIMMER: VirtualHostedNodeNIF = {
 	basicDeviceClass: BASIC_DEVICE_CLASS_ROUTING_SLAVE,
@@ -86,6 +124,8 @@ export const PROFILE_DIMMER: VirtualHostedNodeNIF = {
 		CommandClasses.Version,
 		CommandClasses["Z-Wave Plus Info"],
 		CommandClasses["Manufacturer Specific"],
+		CommandClasses.Security,
+		CommandClasses["Security 2"],
 	],
 	controlledCCs: [],
 };
@@ -107,6 +147,8 @@ export const PROFILE_BINARY: VirtualHostedNodeNIF = {
 		CommandClasses.Version,
 		CommandClasses["Z-Wave Plus Info"],
 		CommandClasses["Manufacturer Specific"],
+		CommandClasses.Security,
+		CommandClasses["Security 2"],
 	],
 	controlledCCs: [],
 };
@@ -123,6 +165,26 @@ export const DEFAULT_LIFELINE_GROUP: VirtualHostedAssociationGroup = {
 	maxNodes: 5,
 	isLifeline: true,
 };
+
+/**
+ * Group 2 on every vnode: "MultilevelSwitch Set Group". Members of this
+ * group receive `MultilevelSwitchCC.Set` whenever the vnode's currentValue
+ * changes (driven by the bridge daemon writing matter state via setValue).
+ *
+ * Mirrors the pattern a real ZEN30 dimmer EP exposes (its own group 3,
+ * "MULTILEVEL SET Group", issuedCommands {MultilevelSwitch: [Set]}). Users
+ * add their target paddle dimmer endpoints to this group via HA's
+ * zwave-js-ui frontend; the vnode auto-pushes Sets to them on every
+ * value change over the vnode-to-paddle S2 SPAN (peer-to-peer, fast).
+ */
+export const DEFAULT_MULTILEVEL_SET_GROUP: VirtualHostedAssociationGroup = {
+	label: "MultilevelSwitch Set Group",
+	maxNodes: 5,
+	isLifeline: false,
+};
+
+/** Group ID for the MultilevelSwitch Set Group. */
+export const MULTILEVEL_SET_GROUP_ID = 2;
 
 /** Persistence schema version. Bump on incompatible format changes. */
 const PERSISTENCE_VERSION = 1;
@@ -223,36 +285,557 @@ export class VirtualHostedNode {
 		current: number | boolean | undefined,
 	) => void;
 
+	/**
+	 * Optional listener fired after `handleCommand` mutates persistable state
+	 * (currently: associations Set/Remove). Driver wires this in
+	 * `registerVirtualHostedNode` so it can flush the virtual-nodes cache
+	 * to disk without VirtualHostedNode depending on the driver directly.
+	 */
+	public onPersistableChange?: (nodeId: number) => void;
+
+	/**
+	 * Sends a CommandClass FROM this virtual node TO the destination
+	 * encoded in `command.nodeId`. Wired by the driver in
+	 * `registerVirtualHostedNode` to `controller.sendCommandFromVirtualNode`.
+	 * Keeps VirtualHostedNode decoupled from the driver — the vnode just
+	 * knows "I have a sender; use it to emit frames".
+	 *
+	 * Used by `setValue` to auto-broadcast `MultilevelSwitchCC.Set` to
+	 * MultilevelSwitch Set Group members on every value change.
+	 */
+	public sender?: (
+		vnodeId: number,
+		command: CommandClass,
+	) => Promise<void>;
+
+	/**
+	 * Per-vnode S2 manager. The vnode acts as the "slave" end of S2:
+	 * tracks SPAN state per peer (mainly HA), holds the network keys
+	 * cloned from the Driver's manager at registration time. Without
+	 * this, every encrypted query from HA fails to decrypt because the
+	 * Driver's own SPAN state with HA doesn't match HA's SPAN with the
+	 * vnode (they're separate node-pair conversations).
+	 *
+	 * Initialized async by Driver.registerVirtualHostedNode. Until then,
+	 * S2 NonceGet handling is a no-op (and HA will eventually give up).
+	 */
+	public sm2: SecurityManager2 | undefined;
+
 	public constructor(id: number, profile: VirtualHostedNodeProfile) {
 		this.id = id;
 		this.profile = profile;
 		this.nif = profileNIF(profile);
-		// Every virtual node starts with the standard Lifeline group.
+		// Every virtual node starts with the standard Lifeline group +
+		// the MultilevelSwitch Set Group (group 2). Users add their target
+		// paddle endpoints to group 2 via HA's zwave-js-ui frontend; the
+		// vnode auto-pushes Sets to them on every value change.
 		this.associationGroups.set(1, DEFAULT_LIFELINE_GROUP);
+		this.associationGroups.set(
+			MULTILEVEL_SET_GROUP_ID,
+			DEFAULT_MULTILEVEL_SET_GROUP,
+		);
 	}
 
 	/**
-	 * Mutate the vnode's value. Fires `onValueChange` so external subscribers
-	 * (e.g. the driver-level event stream) can observe and forward. Idempotent
-	 * — calling with the same value is a no-op (no event fired).
+	 * Mutate the vnode's value AND auto-broadcast `MultilevelSwitchCC.Set`
+	 * to every member of the MultilevelSwitch Set Group (group 2). Mirrors
+	 * how a real ZEN30 dimmer endpoint behaves: its own value change pushes
+	 * Sets to its group-3 associated targets natively.
+	 *
+	 * Fires `onValueChange` for external state-tracking subscribers (driver
+	 * forwards as a "virtual node value updated" event). Idempotent —
+	 * calling with the same value is a no-op (no event, no broadcast).
+	 *
+	 * Async because the broadcast goes over the wire; callers can `await`
+	 * to know when frames have been queued. The actual S2-encrypted radio
+	 * transmission is fire-and-forget once handed off to the controller.
 	 */
-	public setValue(value: number | boolean | undefined): void {
+	public async setValue(
+		value: number | boolean | undefined,
+	): Promise<void> {
 		if (this.currentValue === value) return;
 		const previous = this.currentValue;
 		this.currentValue = value;
 		this.targetValue = value;
 		this.onValueChange?.(this.id, previous, value);
+		await this._broadcastValueChange(value);
 	}
 
+	/**
+	 * Iterate the MultilevelSwitch Set Group's members and dispatch a
+	 * `MultilevelSwitchCC.Set` to each. Used by `setValue`.
+	 *
+	 * Skips silently if:
+	 *  - No sender is wired (vnode not registered yet)
+	 *  - No members in the group (user hasn't configured associations)
+	 *  - Value is `undefined` (can't encode as a level)
+	 *  - Profile is binary (would need BinarySwitchCCSet instead — not
+	 *    yet wired, left as a TODO for binary-profile rollout)
+	 *
+	 * Members with no endpoint default to root (0). Members with an
+	 * endpoint route via MultiChannel encapsulation (zwave-js handles this
+	 * automatically when `endpointIndex` is non-zero).
+	 */
+	private async _broadcastValueChange(
+		value: number | boolean | undefined,
+	): Promise<void> {
+		if (this.sender == null) return;
+		if (value == null) return;
+		const members = this.associations.get(MULTILEVEL_SET_GROUP_ID);
+		if (members == null || members.length === 0) return;
+		if (this.profile !== "dimmer") return;
+		const targetValue = typeof value === "boolean"
+			? (value ? 99 : 0)
+			: Math.max(0, Math.min(99, Math.round(value)));
+		// Late-import to avoid a top-level cycle with @zwave-js/cc.
+		const ccMod: any = await import("@zwave-js/cc/MultilevelSwitchCC");
+		await Promise.allSettled(
+			members.map((m) => {
+				const cc = new ccMod.MultilevelSwitchCCSet({
+					nodeId: m.nodeId,
+					endpointIndex: m.endpoint ?? 0,
+					targetValue,
+					duration: 0,
+				});
+				return this.sender!(this.id, cc);
+			}),
+		);
+	}
+
+	/**
+	 * Phase 5: handle an inbound CC and return the response CC the Driver
+	 * should send back (or `undefined` if no response is expected). The
+	 * Driver wraps the response in a `SendDataBridge` so the destination
+	 * sees it as coming from THIS virtual node.
+	 *
+	 * Coverage prioritized for HA's zwave-js-ui workflow:
+	 *
+	 *   - AssociationCC + MultiChannelAssociationCC: SupportedGroupingsGet,
+	 *     Get, Set, Remove — the UI's group panel reads/writes through
+	 *     these.
+	 *   - AssociationGroupInfoCC: NameGet, InfoGet, CommandListGet — give
+	 *     the UI a label + profile + issued-commands list per group so the
+	 *     group dropdown is meaningful.
+	 *   - VersionCC, ManufacturerSpecificCC, ZWavePlusCC: minimum
+	 *     interview-completion responses; without them HA may keep the
+	 *     vnode in an "interview pending" state that gates association
+	 *     editing in the UI.
+	 *   - MultiChannelCC.EndPointGet: respond "no endpoints" (vnodes are
+	 *     single-endpoint).
+	 *   - NoOperationCC: eat silently.
+	 *
+	 * Unhandled CCs fall through with no response — they remain logged in
+	 * `receivedCommands` for diagnostic visibility.
+	 */
 	public async handleCommand(
 		sourceNodeId: number,
 		command: CommandClass,
-	): Promise<void> {
+	): Promise<CommandClass | undefined> {
 		this.receivedCommands.push({
 			sourceNodeId,
 			commandClass: command.ccId,
 			commandClassName: getCCName(command.ccId),
 		});
+
+		const addr = { nodeId: sourceNodeId, endpointIndex: 0 } as const;
+
+		// ─── AssociationCC ────────────────────────────────────────────────
+		if (command instanceof AssociationCCSupportedGroupingsGet) {
+			return new AssociationCCSupportedGroupingsReport({
+				...addr,
+				groupCount: this.associationGroups.size,
+			});
+		}
+		if (command instanceof AssociationCCGet) {
+			const group = this.associationGroups.get(command.groupId);
+			const members = this.associations.get(command.groupId) ?? [];
+			return new AssociationCCReport({
+				...addr,
+				groupId: command.groupId,
+				maxNodes: group?.maxNodes ?? 0,
+				// Plain AssociationCC reports only node-only members
+				// (no endpoint info) — endpoint-aware membership flows
+				// through MultiChannelAssociationCC.
+				nodeIds: members
+					.filter((m) => m.endpoint == null)
+					.map((m) => m.nodeId),
+				reportsToFollow: 0,
+			});
+		}
+		if (command instanceof AssociationCCSet) {
+			const existing = this.associations.get(command.groupId) ?? [];
+			const additions = command.nodeIds
+				.filter(
+					(nid) =>
+						!existing.some(
+							(m) =>
+								m.endpoint == null && m.nodeId === nid,
+						),
+				)
+				.map((nid) => ({ nodeId: nid }));
+			if (additions.length > 0) {
+				this.associations.set(command.groupId, [
+					...existing,
+					...additions,
+				]);
+				this.onPersistableChange?.(this.id);
+			}
+			return undefined;
+		}
+		if (command instanceof AssociationCCRemove) {
+			this._removeAssociations(
+				command.groupId,
+				command.nodeIds ?? [],
+				/* endpointAware */ false,
+			);
+			return undefined;
+		}
+
+		// ─── MultiChannelAssociationCC ────────────────────────────────────
+		if (command instanceof MultiChannelAssociationCCSupportedGroupingsGet) {
+			return new MultiChannelAssociationCCSupportedGroupingsReport({
+				...addr,
+				groupCount: this.associationGroups.size,
+			});
+		}
+		if (command instanceof MultiChannelAssociationCCGet) {
+			const group = this.associationGroups.get(command.groupId);
+			const members = this.associations.get(command.groupId) ?? [];
+			return new MultiChannelAssociationCCReport({
+				...addr,
+				groupId: command.groupId,
+				maxNodes: group?.maxNodes ?? 0,
+				nodeIds: members
+					.filter((m) => m.endpoint == null)
+					.map((m) => m.nodeId),
+				endpoints: members
+					.filter((m) => m.endpoint != null)
+					.map((m) => ({
+						nodeId: m.nodeId,
+						endpoint: m.endpoint!,
+					})),
+				reportsToFollow: 0,
+			});
+		}
+		if (command instanceof MultiChannelAssociationCCSet) {
+			const existing = this.associations.get(command.groupId) ?? [];
+			const additions: VirtualHostedAssociationMember[] = [];
+			for (const nid of command.nodeIds ?? []) {
+				if (
+					!existing.some(
+						(m) => m.endpoint == null && m.nodeId === nid,
+					)
+				) {
+					additions.push({ nodeId: nid });
+				}
+			}
+			for (const ep of command.endpoints ?? []) {
+				const epIdx = typeof ep.endpoint === "number"
+					? ep.endpoint
+					: undefined;
+				if (epIdx == null) continue;
+				if (
+					!existing.some(
+						(m) =>
+							m.endpoint === epIdx
+							&& m.nodeId === ep.nodeId,
+					)
+				) {
+					additions.push({
+						nodeId: ep.nodeId,
+						endpoint: epIdx,
+					});
+				}
+			}
+			if (additions.length > 0) {
+				this.associations.set(command.groupId, [
+					...existing,
+					...additions,
+				]);
+				this.onPersistableChange?.(this.id);
+			}
+			return undefined;
+		}
+		if (command instanceof MultiChannelAssociationCCRemove) {
+			const epPairs: VirtualHostedAssociationMember[] = [];
+			for (const ep of command.endpoints ?? []) {
+				const epIdx = typeof ep.endpoint === "number"
+					? ep.endpoint
+					: undefined;
+				if (epIdx == null) continue;
+				epPairs.push({ nodeId: ep.nodeId, endpoint: epIdx });
+			}
+			this._removeAssociations(
+				command.groupId,
+				command.nodeIds ?? [],
+				/* endpointAware */ true,
+				epPairs,
+			);
+			return undefined;
+		}
+
+		// ─── AssociationGroupInfoCC ───────────────────────────────────────
+		if (command instanceof AssociationGroupInfoCCNameGet) {
+			const group = this.associationGroups.get(command.groupId);
+			return new AssociationGroupInfoCCNameReport({
+				...addr,
+				groupId: command.groupId,
+				name: group?.label ?? `Group ${command.groupId}`,
+			});
+		}
+		if (command instanceof AssociationGroupInfoCCInfoGet) {
+			// listMode requests info about ALL groups in one report; targeted
+			// requests one specific groupId. A targeted Get with undefined
+			// groupId is malformed — fall back to an empty list.
+			const groupIds: number[] = command.listMode
+				? Array.from(this.associationGroups.keys())
+				: command.groupId != null
+				? [command.groupId]
+				: [];
+			return new AssociationGroupInfoCCInfoReport({
+				...addr,
+				isListMode: command.listMode ?? false,
+				hasDynamicInfo: false,
+				groups: groupIds.map((gid) => {
+					const g = this.associationGroups.get(gid);
+					const profile = g?.isLifeline
+						? AssociationGroupInfoProfile["General: Lifeline"]
+						: gid === MULTILEVEL_SET_GROUP_ID
+						? AssociationGroupInfoProfile["Control: Key 01"]
+						: AssociationGroupInfoProfile["General: N/A"];
+					return {
+						groupId: gid,
+						mode: 0,
+						profile,
+						eventCode: 0,
+					};
+				}),
+			});
+		}
+		if (command instanceof AssociationGroupInfoCCCommandListGet) {
+			// Per-group "issued commands" advertisement — the UI shows this
+			// as "this group sends: …".
+			//   Group 1 (Lifeline): unsolicited MultilevelSwitch/BinarySwitch
+			//     + Basic Reports (the bridge daemon emits these via
+			//     sendCommandFromVirtualNode as a Report when wanted).
+			//   Group 2 (MultilevelSwitch Set Group): MultilevelSwitch.Set
+			//     auto-pushed by VirtualHostedNode.setValue() on every
+			//     value mutation. Mirrors paddle 71 EP 1 group 3's
+			//     issuedCommands {38: [Set]} declaration.
+			const commands = new Map<CommandClasses, readonly number[]>();
+			if (command.groupId === 1) {
+				if (this.profile === "dimmer") {
+					commands.set(CommandClasses["Multilevel Switch"], [
+						0x03,
+					]); // Report
+				} else {
+					commands.set(CommandClasses["Binary Switch"], [0x03]);
+				}
+				commands.set(CommandClasses.Basic, [0x03]);
+			} else if (command.groupId === MULTILEVEL_SET_GROUP_ID) {
+				if (this.profile === "dimmer") {
+					commands.set(CommandClasses["Multilevel Switch"], [
+						0x01,
+					]); // Set
+				} else {
+					commands.set(CommandClasses["Binary Switch"], [0x01]);
+				}
+			}
+			return new AssociationGroupInfoCCCommandListReport({
+				...addr,
+				groupId: command.groupId,
+				commands,
+			});
+		}
+
+		// ─── VersionCC ────────────────────────────────────────────────────
+		if (command instanceof VersionCCGet) {
+			return new VersionCCReport({
+				...addr,
+				libraryType: ZWaveLibraryTypes["Routing Slave"],
+				protocolVersion: "7.22",
+				firmwareVersions: ["1.0"],
+				hardwareVersion: 1,
+			});
+		}
+		if (command instanceof VersionCCCommandClassGet) {
+			return new VersionCCCommandClassReport({
+				...addr,
+				requestedCC: command.requestedCC,
+				ccVersion: this._ccVersionForReport(command.requestedCC),
+			});
+		}
+
+		// ─── ManufacturerSpecificCC ───────────────────────────────────────
+		if (command instanceof ManufacturerSpecificCCGet) {
+			return new ManufacturerSpecificCCReport({
+				...addr,
+				// Zooz manufacturer id (0x0312) is a polite placeholder
+				// since the bridge daemon is hosted on Zooz silicon. Product
+				// type/id are arbitrary internal identifiers.
+				manufacturerId: 0x0312,
+				productType: 0xbeef,
+				productId: this.profile === "dimmer" ? 0x0001 : 0x0002,
+			});
+		}
+
+		// ─── ZWavePlusCC ──────────────────────────────────────────────────
+		if (command instanceof ZWavePlusCCGet) {
+			return new ZWavePlusCCReport({
+				...addr,
+				zwavePlusVersion: 2,
+				nodeType: ZWavePlusNodeType.Node,
+				roleType: ZWavePlusRoleType.AlwaysOnSlave,
+				installerIcon: 0x0000,
+				userIcon: 0x0000,
+			});
+		}
+
+		// ─── MultiChannelCC (endpoint discovery) ──────────────────────────
+		if (command instanceof MultiChannelCCEndPointGet) {
+			return new MultiChannelCCEndPointReport({
+				...addr,
+				countIsDynamic: false,
+				identicalCapabilities: true,
+				individualCount: 0,
+				aggregatedCount: 0,
+			});
+		}
+
+		// ─── Security2CCNonceGet (S2 SPAN bootstrap, Phase 4c) ───────────
+		// HA initiates an S2 SPAN with the vnode by sending NonceGet before
+		// any encrypted CC query. We generate a Singlecast PAN nonce (REI)
+		// using the vnode's own SecurityManager2 — separate from the
+		// Driver's manager so HA ↔ vnode SPAN state doesn't collide with
+		// HA ↔ Driver SPAN state. The vnode's sm2 holds the network keys
+		// (cloned at register time) so the SPAN can derive correct AES-CCM
+		// keys for subsequent encrypted frames.
+		//
+		// SOS=true (Sender includes Sender's EI), MOS=false (no multicast
+		// out of sync). After this report, HA can encrypt CCs to us using
+		// the SPAN; subsequent Security2CCMessageEncapsulation frames
+		// addressed at this vnode get decapped via the vnode's sm2 (see
+		// Driver dispatch path).
+		if (command instanceof Security2CCNonceGet) {
+			if (this.sm2 == null) return undefined;
+			const nonce = await this.sm2.generateNonce(sourceNodeId);
+			return new Security2CCNonceReport({
+				...addr,
+				SOS: true,
+				MOS: false,
+				receiverEI: nonce,
+			});
+		}
+
+		// ─── Security2CCCommandsSupportedGet ─────────────────────────────
+		// After the S2 SPAN is established, HA queries which CCs the node
+		// supports under S2 encryption. We report the same set as our NIF
+		// (excluding Security CCs themselves which are implicit). HA uses
+		// this to mark CCs as `secure: true` in its cache and to subsequent
+		// query them inside Security2CCMessageEncapsulation wrappers.
+		if (command instanceof Security2CCCommandsSupportedGet) {
+			return new Security2CCCommandsSupportedReport({
+				...addr,
+				supportedCCs: this.nif.supportedCCs.filter(
+					(cc) =>
+						cc !== CommandClasses.Security
+						&& cc !== CommandClasses["Security 2"],
+				) as CommandClasses[],
+			});
+		}
+
+		// ─── SecurityCC (S0): intentionally NOT handled here. ────────────
+		// App-layer-generated nonces don't sync with the radio's nonce
+		// table, so any encrypted CC follow-up from the primary will fail
+		// MAC verification at the radio and be silently dropped. Without a
+		// nonce response, HA gives up on S0 fallback faster and may
+		// continue with other interview stages. Better outcome than a
+		// permanent nonce-loop with no progress.
+
+		// ─── NoOperationCC ────────────────────────────────────────────────
+		if (command instanceof NoOperationCC) {
+			return undefined;
+		}
+
+		return undefined;
+	}
+
+	/**
+	 * Shared Remove implementation for AssociationCC + MultiChannel variant.
+	 * Per Z-Wave spec:
+	 *  - if groupId is 0 (or undefined): apply to all groups
+	 *  - if nodeIds + endpoints both empty: remove ALL members from the
+	 *    targeted group(s)
+	 *  - otherwise: remove only the listed node-only and endpoint-aware
+	 *    members from the targeted group(s)
+	 */
+	private _removeAssociations(
+		groupId: number | undefined,
+		nodeIds: number[],
+		_endpointAware: boolean,
+		endpointPairs: VirtualHostedAssociationMember[] = [],
+	): void {
+		const targets = groupId && groupId > 0
+			? [groupId]
+			: Array.from(this.associations.keys());
+		const removeAll =
+			nodeIds.length === 0 && endpointPairs.length === 0;
+		let changed = false;
+		for (const gid of targets) {
+			const existing = this.associations.get(gid);
+			if (existing == null || existing.length === 0) continue;
+			if (removeAll) {
+				this.associations.delete(gid);
+				changed = true;
+				continue;
+			}
+			const next = existing.filter((m) => {
+				if (m.endpoint == null) {
+					return !nodeIds.includes(m.nodeId);
+				}
+				return !endpointPairs.some(
+					(ep) =>
+						ep.nodeId === m.nodeId
+						&& ep.endpoint === m.endpoint,
+				);
+			});
+			if (next.length !== existing.length) {
+				if (next.length === 0) this.associations.delete(gid);
+				else this.associations.set(gid, next);
+				changed = true;
+			}
+		}
+		if (changed) this.onPersistableChange?.(this.id);
+	}
+
+	/**
+	 * Best-effort CC version response. We declare the minimum sane version
+	 * for each supported CC and the spec-defined v0 for anything else.
+	 */
+	private _ccVersionForReport(cc: CommandClasses): number {
+		switch (cc) {
+			case CommandClasses.Basic:
+				return 2;
+			case CommandClasses["Multilevel Switch"]:
+				return 4;
+			case CommandClasses["Binary Switch"]:
+				return 2;
+			case CommandClasses.Association:
+				return 3;
+			case CommandClasses["Multi Channel Association"]:
+				return 4;
+			case CommandClasses["Association Group Information"]:
+				return 3;
+			case CommandClasses.Version:
+				return 3;
+			case CommandClasses["Z-Wave Plus Info"]:
+				return 2;
+			case CommandClasses["Manufacturer Specific"]:
+				return 2;
+			default:
+				// 0 = "not supported" per spec.
+				return 0;
+		}
 	}
 
 	/**

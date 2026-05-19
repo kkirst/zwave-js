@@ -328,6 +328,7 @@ import { DeviceClass } from "../node/DeviceClass.js";
 import { ZWaveNode } from "../node/Node.js";
 import {
 	profileNIF,
+	VirtualHostedNode,
 	type VirtualHostedNodeProfile,
 } from "../node/VirtualHostedNode.js";
 import { VirtualNode } from "../node/VirtualNode.js";
@@ -4079,6 +4080,35 @@ export class ZWaveController
 			}
 			if (bootstrapFailure != undefined) {
 				newNode.failedS2Bootstrapping = true;
+
+				// Phase 4b polish (2026-05-19): proxy-bridge trust applies
+				// even when S2 IS in the vnode's NIF but KEX failed (e.g.
+				// our virtual slave can't do real KEX). The "no Security CC
+				// in NIF" else-branch below grants S2_Authenticated based on
+				// inclusion-controller trust; replicate that here so the
+				// vnode ends up with a usable security class instead of
+				// "Added with security None" (which then silently blocks
+				// HA's auto-interview). The wire-level encryption story is
+				// the same either way: the radio that hosts the slave has
+				// the network keys and handles frame encryption.
+				const inclCtrlrClass = inclCtrlr.getHighestSecurityClass();
+				const inclCtrlrIsS2 = inclCtrlrClass != undefined
+					&& inclCtrlrClass !== SecurityClass.None
+					&& inclCtrlrClass !== SecurityClass.S0_Legacy;
+				if (inclCtrlrIsS2) {
+					for (const secClass of securityClassOrder) {
+						newNode.securityClasses.set(
+							secClass,
+							secClass === SecurityClass.S2_Authenticated,
+						);
+					}
+					this.driver.controllerLog.logNode(
+						newNode.id,
+						`KEX failed but inclusion controller ${inclCtrlr.id} is S2 — granting S2_Authenticated (proxy-bridge trust)`,
+					);
+					bootstrapFailure = undefined;
+					newNode.failedS2Bootstrapping = false;
+				}
 			}
 		} else if (
 			newNode.supportsCC(CommandClasses.Security)
@@ -9701,21 +9731,117 @@ export class ZWaveController
 		vnodeId: number,
 		command: CommandClass,
 	): Promise<void> {
-		if (!this.driver.virtualNodes.has(vnodeId)) {
+		const vn = this.driver.virtualNodes.get(vnodeId);
+		if (!vn) {
 			throw new ZWaveError(
 				`Cannot send from node ${vnodeId} — not a hosted virtual node`,
 				ZWaveErrorCodes.Controller_NodeNotFound,
 				vnodeId,
 			);
 		}
+
+		// Phase 4c (outbound S2): wrap with Security2CCMessageEncapsulation
+		// when the destination is an S2-secured node (e.g. HA at
+		// S2_Authenticated). Uses the vnode's SecurityManager2 which has
+		// the SPAN state established during the inbound NonceGet exchange.
+		// Without this wrap, our responses would arrive unencrypted at a
+		// node that expects S2-protected traffic from us, and HA would
+		// drop them as a security violation.
+		let outbound: CommandClass = command;
+		const destNode = typeof command.nodeId === "number"
+			? this.nodes.get(command.nodeId)
+			: undefined;
+		const destSecClass = destNode?.getHighestSecurityClass();
+		const destExpectsS2 = destSecClass != undefined
+			&& destSecClass !== SecurityClass.None
+			&& destSecClass !== SecurityClass.S0_Legacy;
+		// Don't double-wrap bare S2 protocol messages (NonceGet/Report, KEX
+		// dance). These travel unencrypted as part of SPAN/KEX setup.
+		// Everything else — including the encrypted Security2CCCommands*
+		// Report and ALL application CCs (MultilevelSwitch, Association,
+		// etc.) — gets wrapped.
+		const {
+			Security2CCMessageEncapsulation,
+			Security2CCNonceGet,
+			Security2CCNonceReport,
+		} = await import("@zwave-js/cc/Security2CC");
+		const isBareS2Protocol = command instanceof Security2CCNonceGet
+			|| command instanceof Security2CCNonceReport
+			|| command instanceof Security2CCMessageEncapsulation;
+		if (
+			vn.sm2 && destExpectsS2 && !isBareS2Protocol
+			&& typeof command.nodeId === "number"
+		) {
+			// Wrap with the class our vnode was granted (proxyBootstrap
+			// grants S2_Authenticated). Both ends know this key — the vnode
+			// because we cloned all network keys into its SM2, the
+			// destination because all network nodes share the keys. Using a
+			// higher class (e.g. destination's own S2_AccessControl) would
+			// derive a SPAN against a key the destination might not expect
+			// for traffic FROM us, causing MAC verification to fail on
+			// receive.
+			const vnodeGranted = SecurityClass.S2_Authenticated;
+			outbound = Security2CCMessageEncapsulation.encapsulate(
+				command,
+				vn.id,
+				{
+					securityManager: undefined,
+					securityManager2: vn.sm2,
+					securityManagerLR: undefined,
+				},
+				{ securityClass: vnodeGranted },
+			);
+			this.driver.controllerLog.print(
+				`bridge: S2-wrapped outbound from vnode ${vn.id} → ${command.nodeId} (class ${
+					SecurityClass[vnodeGranted]
+				})`,
+			);
+		}
+
 		this.driver.controllerLog.print(
 			`bridge: sendCommandFromVirtualNode(vnode=${vnodeId} → dest=${command.nodeId}) — ${command.constructor.name}`,
 		);
+
+		// Phase 4c (outbound S2 encoding ctx): the wrapped CC's serialize()
+		// pulls securityManager2 + ownNodeId from CCEncodingContext via
+		// assertSecurityTX. Driver's standard getEncodingContext returns the
+		// CONTROLLER's SM2 + ownNodeId, but for vnode-sourced frames we need
+		// the VNODE's SM2 (it holds the SPAN state established with HA during
+		// the inbound NonceGet/Report exchange) and the VNODE's ID (auth data
+		// CCM nonce is keyed on the sender). Without this override the frame
+		// is encrypted with the wrong SPAN counter and HA's MAC verification
+		// fails → HA replies with NonceReport to reset SPAN → loop.
+		//
+		// Pre-serializing here (with the vnode-rooted ctx) and passing raw
+		// bytes via `serializedCC` bypasses the lazy serialize-at-send path
+		// that would otherwise re-pull the driver's encoding ctx.
+		let serializedCC: BytesView | undefined;
+		if (outbound !== command && vn.sm2) {
+			const driverCtx = (this.driver as any).getEncodingContext();
+			const vnodeCtx = {
+				...driverCtx,
+				ownNodeId: vn.id,
+				securityManager: undefined,
+				securityManager2: vn.sm2,
+				securityManagerLR: undefined,
+			};
+			serializedCC = await outbound.serialize(vnodeCtx);
+		}
+
+		// We always pass `command: outbound` so the driver's MessageGenerator
+		// dispatcher sees `containsCC(msg)` as true (it routes by inspecting
+		// `msg.command`). If we pre-serialized with a vnode-rooted encoding
+		// context, also attach the bytes to `serializedCC` directly — that
+		// short-circuits `serializeCC()` away from re-encoding under the
+		// driver's standard ctx.
 		const msg = new SendDataBridgeRequest({
 			sourceNodeId: vnodeId,
-			command: command as any,
+			command: outbound as any,
 			maxSendAttempts: 1,
 		});
+		if (serializedCC) {
+			(msg as any).serializedCC = serializedCC;
+		}
 		await this.driver.sendMessage(msg);
 	}
 
@@ -9981,6 +10107,53 @@ export class ZWaveController
 					Date.now() - pending.startedAt
 				} ms — newNodeId=${msg.newNodeId}`,
 			);
+			// Phase 4 fix (2026-05-19): the radio allocated the slot but
+			// without explicit registration the new vnode wouldn't be in
+			// driver.virtualNodes, so the dispatch hook in handleRequest
+			// would drop every inbound frame addressed to it (HA's
+			// interview queries time out, node looks "asleep"). Register
+			// here using the requested profile + persist immediately so
+			// the vnode survives a driver restart.
+			if (msg.newNodeId > 0) {
+				const vn = new VirtualHostedNode(
+					msg.newNodeId,
+					pending.profile,
+				);
+				this.driver.registerVirtualHostedNode(vn);
+				this.driver.controllerLog.print(
+					`bridge: virtual-node ${msg.newNodeId} (profile=${pending.profile}) registered in driver.virtualNodes`,
+				);
+				void this.driver.saveVirtualHostedNodes().catch((err) => {
+					this.driver.controllerLog.print(
+						`bridge: failed to persist virtual-nodes cache after registration: ${
+							(err as Error)?.message ?? err
+						}`,
+						"error",
+					);
+				});
+				// Phase 4d (2026-05-19): install the slot's NIF immediately so the
+				// radio reports the correct generic/specific device class + CC
+				// list. Order matters: the primary controller reads the NIF
+				// via GetNodeProtocolInfo / RequestNodeInfo during the
+				// subsequent InclusionControllerCC.Initiate(ProxyInclusion) flow
+				// (notifyPrimaryOfProxyInclusion below). If we leave NIF setup
+				// to the caller, there's a race: the caller usually invokes
+				// notifyPrimaryOfProxyInclusion before setVirtualNodeNIF, and
+				// the primary captures generic=0/specific=0 in its bitmap.
+				// That cached deviceClass=0/0 then makes the primary short-
+				// circuit interview (no CCs probed because device class is
+				// unknown). Auto-installing here eliminates the race.
+				void this.setVirtualNodeNIF(msg.newNodeId, pending.profile).catch(
+					(err) => {
+						this.driver.controllerLog.print(
+							`bridge: auto-setVirtualNodeNIF failed for newly-allocated vnode ${msg.newNodeId}: ${
+								(err as Error)?.message ?? err
+							}`,
+							"error",
+						);
+					},
+				);
+			}
 			pending.resolve(msg);
 			return true;
 		}

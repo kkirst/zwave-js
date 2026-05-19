@@ -1119,6 +1119,73 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 				current,
 			});
 		};
+		// Phase 5: persist association table mutations so they survive a
+		// driver restart. Fire-and-forget — saveVirtualHostedNodes already
+		// guards against concurrent saves internally.
+		vn.onPersistableChange = (nodeId) => {
+			this.driverLog.print(
+				`bridge: virtual node ${nodeId} associations changed; flushing cache`,
+			);
+			void this.saveVirtualHostedNodes().catch((err) => {
+				this.driverLog.print(
+					`bridge: failed to persist virtual nodes: ${
+						(err as Error)?.message ?? err
+					}`,
+					"error",
+				);
+			});
+		};
+		// Phase 5 (auto-Set): wire the vnode's broadcast sender to the
+		// controller's sendCommandFromVirtualNode so setValue() can
+		// natively push MultilevelSwitch.Set to MultilevelSwitch Set
+		// Group members on every value change. No daemon involvement —
+		// this mirrors how a real ZEN30 dimmer EP auto-pushes to its
+		// group 3 associated targets.
+		vn.sender = async (vnodeId, command) => {
+			if (this._controller == undefined) return;
+			await this._controller.sendCommandFromVirtualNode(
+				vnodeId,
+				command,
+			);
+		};
+		// Phase 4c: give the vnode its own SecurityManager2 with the network
+		// keys cloned from the driver. Each pair-of-nodes maintains its own
+		// SPAN state; the vnode acts as the slave end of an (HA, vnode)
+		// conversation and tracks SPAN per peer (mainly HA = node 1). The
+		// keys are the same shared network keys the radio holds, so frames
+		// emitted from the vnode can be decrypted by any S2-capable peer
+		// that knows the network keys. Fire-and-forget — until the SM2 is
+		// ready, the vnode's Security2CCNonceGet handler returns undefined
+		// (HA will just retry).
+		void (async () => {
+			try {
+				const sm2 = await SecurityManager2.create();
+				for (
+					const secClass of [
+						"S2_Unauthenticated",
+						"S2_Authenticated",
+						"S2_AccessControl",
+						"S0_Legacy",
+					] as const
+				) {
+					const key = this._options.securityKeys?.[secClass];
+					if (key) {
+						await sm2.setKey(SecurityClass[secClass], key);
+					}
+				}
+				vn.sm2 = sm2;
+				this.controllerLog.print(
+					`bridge: vnode ${vn.id} S2 security manager initialized`,
+				);
+			} catch (err) {
+				this.driverLog.print(
+					`bridge: failed to init vnode ${vn.id} S2 manager: ${
+						(err as Error)?.message ?? err
+					}`,
+					"error",
+				);
+			}
+		})();
 	}
 
 	/**
@@ -4521,10 +4588,58 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 
 			// Parse embedded CCs
 			if (isCommandRequest(msg) && containsSerializedCC(msg)) {
+				// Phase 4c: if this frame is addressed to one of our hosted
+				// virtual nodes, override the CC parsing context's
+				// securityManager2 + ownNodeId to use the vnode's instance.
+				// Without this, S2 decryption would use the Driver's SPAN
+				// state (HA ↔ Driver), but HA actually established SPAN with
+				// the VNODE (HA ↔ vnode 119, etc.) which is a separate
+				// peer-pair context.
+				let baseCCCtx = this.getCCParsingContext();
+				const tgt = (msg as any).targetNodeId;
+				if (typeof tgt === "number") {
+					const vn = this.virtualNodes.get(tgt);
+					if (vn && vn.sm2) {
+						// Override hasSecurityClass / getHighestSecurityClass
+						// to report the VNODE's perspective on the sender's
+						// granted classes. The decrypt LocalEI path iterates
+						// `possibleSecurityClasses` filtered by
+						// ctx.hasSecurityClass(sender, c). Controller's view
+						// shows HA at S2_AccessControl, but HA actually
+						// encrypted vnode-bound frames at S2_Authenticated.
+						// Without this override the decrypt picks the wrong
+						// key class and fails.
+						const vnodeSecClass = SecurityClass.S2_Authenticated;
+						const origHasSecurityClass =
+							baseCCCtx.hasSecurityClass;
+						const origGetHighest =
+							baseCCCtx.getHighestSecurityClass;
+						baseCCCtx = {
+							...baseCCCtx,
+							ownNodeId: vn.id,
+							securityManager2: vn.sm2,
+							hasSecurityClass: (
+								nodeId: number,
+								sc: SecurityClass,
+							) => {
+								if (nodeId === msg!.getNodeId()) {
+									return sc === vnodeSecClass;
+								}
+								return origHasSecurityClass(nodeId, sc);
+							},
+							getHighestSecurityClass: (nodeId: number) => {
+								if (nodeId === msg!.getNodeId()) {
+									return vnodeSecClass;
+								}
+								return origGetHighest(nodeId);
+							},
+						} as any;
+					}
+				}
 				msg.command = await CommandClass.parse(
 					msg.serializedCC,
 					{
-						...this.getCCParsingContext(),
+						...baseCCCtx,
 						sourceNodeId: msg.getNodeId()!,
 						frameType: msg.frameType,
 					},
@@ -4671,10 +4786,23 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					return;
 				}
 
-				// Make sure we are allowed to handle this command
+				// Make sure we are allowed to handle this command.
+				// Phase 4c: skip the security-level downgrade check for frames
+				// targeting a hosted vnode. The check uses the SENDER's known
+				// class (controller↔HA = S2_AccessControl), but HA correctly
+				// uses the vnode's class (vnode↔HA = S2_Authenticated) for
+				// vnode-targeted frames. The controller-side check would flag
+				// these as downgrades and discard the frame; the vnode's own
+				// dispatch (with vn.sm2-rooted parsing context) handles its own
+				// security semantics.
+				const tgtVnode =
+					typeof (msg as any).targetNodeId === "number"
+					&& this.virtualNodes.has((msg as any).targetNodeId);
 				if (
-					this.isSecurityLevelTooLow(msg.command)
-					|| this.shouldDiscardCC(msg.command)
+					!tgtVnode && (
+						this.isSecurityLevelTooLow(msg.command)
+						|| this.shouldDiscardCC(msg.command)
+					)
 				) {
 					if (!wasMessageLogged) {
 						this.driverLog.logMessage(msg, {
@@ -4957,22 +5085,64 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					});
 				}
 			} else if (!this.hasPendingTransactions(isS2NonceReport)) {
-				this.controllerLog.logNode(nodeId, {
-					message:
-						`${message}, cannot decode command. Requesting a nonce...`,
-					level: "verbose",
-					direction: "outbound",
-				});
-				// Send the node our nonce, and use the chance to re-sync the MPAN if necessary
-				const s2MulticastOutOfSync = isCommandRequest(msg)
-					&& this.mustReplyWithSecurityS2MOS(msg);
-
-				node.commandClasses["Security 2"]
-					.withOptions({ s2MulticastOutOfSync })
-					.sendNonce()
-					.catch(() => {
-						// Ignore errors
+				// Phase 4c (2026-05-19): if the failed decode was for a frame
+				// addressed to a hosted vnode (not the controller itself), the
+				// recovery NonceReport must be sent FROM that vnode using its
+				// own SM2 — not from the controller's identity. Otherwise the
+				// peer re-syncs the wrong peer-pair SPAN (controller↔HA instead
+				// of vnode↔HA) and decode keeps failing on the next attempt.
+				const vnodeTarget = typeof (msg as any).targetNodeId === "number"
+					? this.virtualNodes.get((msg as any).targetNodeId)
+					: undefined;
+				if (vnodeTarget && vnodeTarget.sm2) {
+					this.controllerLog.logNode(nodeId, {
+						message:
+							`${message}, cannot decode command from vnode ${vnodeTarget.id}'s perspective. Sending vnode-sourced NonceReport...`,
+						level: "verbose",
+						direction: "outbound",
 					});
+					void (async () => {
+						try {
+							const receiverEI = await vnodeTarget.sm2!.generateNonce(nodeId);
+							const { Security2CCNonceReport } = await import(
+								"@zwave-js/cc/Security2CC"
+							);
+							const nr = new Security2CCNonceReport({
+								nodeId,
+								endpointIndex: 0,
+								SOS: true,
+								MOS: false,
+								receiverEI,
+							});
+							await this.controller.sendCommandFromVirtualNode(
+								vnodeTarget.id,
+								nr,
+							);
+						} catch (err) {
+							this.controllerLog.print(
+								`bridge: vnode-sourced NonceReport failed: ${(err as Error)?.message ?? err}`,
+								"error",
+							);
+						}
+					})();
+				} else {
+					this.controllerLog.logNode(nodeId, {
+						message:
+							`${message}, cannot decode command. Requesting a nonce...`,
+						level: "verbose",
+						direction: "outbound",
+					});
+					// Send the node our nonce, and use the chance to re-sync the MPAN if necessary
+					const s2MulticastOutOfSync = isCommandRequest(msg)
+						&& this.mustReplyWithSecurityS2MOS(msg);
+
+					node.commandClasses["Security 2"]
+						.withOptions({ s2MulticastOutOfSync })
+						.sendNonce()
+						.catch(() => {
+							// Ignore errors
+						});
+				}
 			} else {
 				this.controllerLog.logNode(nodeId, {
 					message: `${message}, cannot decode command.`,
@@ -6164,7 +6334,28 @@ ${handlers.length} left`,
 					} from node ${sourceNodeId} to virtual node ${vn.id}`,
 				);
 				if (msg.command) {
-					await vn.handleCommand(sourceNodeId, msg.command);
+					try {
+						const response = await vn.handleCommand(
+							sourceNodeId,
+							msg.command,
+						);
+						if (response) {
+							this.driverLog.print(
+								`bridge: vnode ${vn.id} → node ${sourceNodeId} reply ${response.constructor.name}`,
+							);
+							await this._controller.sendCommandFromVirtualNode(
+								vn.id,
+								response,
+							);
+						}
+					} catch (err) {
+						this.driverLog.print(
+							`bridge: vnode ${vn.id} handleCommand failed: ${
+								(err as Error)?.message ?? err
+							}`,
+							"error",
+						);
+					}
 				}
 				return;
 			}
