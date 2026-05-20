@@ -1224,6 +1224,171 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		vn.setBinaryValue(value);
 	}
 
+	/**
+	 * Phase 5d: open a WS to each bridge peer at startup, query its
+	 * `controller.get_virtual_hosted_nodes`, and reconcile against this
+	 * primary's `controller.nodes`. Cache-hit vnodes are confirmed
+	 * silently; cache-miss vnodes trigger a one-shot
+	 * `controller.notify_primary_of_proxy_inclusion` on the peer, which
+	 * causes the normal inclusion flow on this primary. Replaces the
+	 * push-on-timer daemon heartbeat with a pull-on-startup model.
+	 *
+	 * Logs via `console.log` because HA's zwave-js-ui filters the
+	 * CNTRLR/DRIVER zwave-js log channels at the wrapper layer; console
+	 * always lands in `docker logs zwave-js-ui`.
+	 */
+	private async _pullVirtualNodesFromBridgePeers(
+		urls: string[],
+	): Promise<void> {
+		console.log(
+			`[bridge-peer-pull] starting reconciliation against ${urls.length} peer(s): [${
+				urls.join(", ")
+			}]`,
+		);
+		for (const url of urls) {
+			try {
+				const vnodes = await this._fetchPeerVirtualNodes(url);
+				console.log(
+					`[bridge-peer-pull] ${url}: discovered ${vnodes.length} hosted vnode(s) [${
+						vnodes.map((v) => v.nodeId).join(", ")
+					}]`,
+				);
+				let confirmed = 0;
+				let triggered = 0;
+				for (const vn of vnodes) {
+					const known = this._controller?.nodes.has(vn.nodeId)
+						?? false;
+					if (known) {
+						confirmed++;
+						continue;
+					}
+					triggered++;
+					console.log(
+						`[bridge-peer-pull] ${url}: vnode ${vn.nodeId} (profile=${vn.profile}) cache-miss → requesting one-shot notify_primary_of_proxy_inclusion`,
+					);
+					try {
+						await this._invokePeerCommand(url, {
+							command:
+								"controller.notify_primary_of_proxy_inclusion",
+							newNodeId: vn.nodeId,
+						});
+					} catch (innerErr) {
+						console.error(
+							`[bridge-peer-pull] ${url}: notify_primary_of_proxy_inclusion(${vn.nodeId}) failed:`,
+							innerErr,
+						);
+					}
+				}
+				console.log(
+					`[bridge-peer-pull] ${url}: reconcile done (${confirmed} cache-hit, ${triggered} one-shot include)`,
+				);
+			} catch (err) {
+				console.error(
+					`[bridge-peer-pull] ${url}: pull failed:`,
+					err,
+				);
+			}
+		}
+	}
+
+	/**
+	 * One-shot WS query to a zwave-js-server: connect →
+	 * controller.get_virtual_hosted_nodes → disconnect. Returns the list.
+	 * Throws on connection failure, non-success, or overall timeout.
+	 */
+	private async _fetchPeerVirtualNodes(
+		url: string,
+	): Promise<Array<{ nodeId: number; profile: "dimmer" | "binary" }>> {
+		const result = await this._invokePeerCommand(url, {
+			command: "controller.get_virtual_hosted_nodes",
+		});
+		const nodes = (result as any)?.nodes;
+		if (!Array.isArray(nodes)) {
+			throw new Error(
+				`unexpected get_virtual_hosted_nodes response shape: ${
+					JSON.stringify(result)
+				}`,
+			);
+		}
+		return nodes;
+	}
+
+	/**
+	 * Connect to a zwave-js-server, send a single command, await its
+	 * result, disconnect. Bare-bones client for the bridge-peer pull —
+	 * uses the `ws` package the runtime container already provides
+	 * (loaded via dynamic import so the build doesn't require it).
+	 */
+	private async _invokePeerCommand(
+		url: string,
+		message: Record<string, unknown>,
+		overallTimeoutMs: number = 15000,
+	): Promise<unknown> {
+		// @ts-ignore TS2307: `ws` resolved at runtime by the container
+		const wsMod: any = await import("ws");
+		const WebSocketCtor: any = wsMod.WebSocket ?? wsMod.default;
+		const ws = new WebSocketCtor(url);
+		try {
+			let messageIdCounter = 1;
+			const sendCommand = (
+				cmdMessage: Record<string, unknown>,
+			): Promise<any> => {
+				return new Promise((resolve, reject) => {
+					const messageId =
+						`bridgeperr-${messageIdCounter++}`;
+					const onMessage = (data: any) => {
+						let body: any;
+						try {
+							body = JSON.parse(data.toString());
+						} catch {
+							return;
+						}
+						if (body?.messageId !== messageId) return;
+						ws.off("message", onMessage);
+						if (body.success === false || body.errorCode) {
+							reject(
+								new Error(
+									`peer error: ${
+										body.errorCode ?? "?"
+									} ${body.message ?? ""}`,
+								),
+							);
+							return;
+						}
+						resolve(body.result);
+					};
+					ws.on("message", onMessage);
+					ws.send(JSON.stringify({ messageId, ...cmdMessage }));
+				});
+			};
+			const overall = new Promise<unknown>((_, reject) => {
+				setTimeout(
+					() => reject(new Error(`peer ${url} timeout`)),
+					overallTimeoutMs,
+				);
+			});
+			const work = (async () => {
+				await new Promise<void>((resolve, reject) => {
+					ws.once("open", () => resolve());
+					ws.once("error", (e: any) => reject(e));
+				});
+				// Eat any leading server_info handshake frame(s).
+				await new Promise<void>((resolve) => {
+					setTimeout(resolve, 200);
+				});
+				await sendCommand({ command: "start_listening" });
+				return sendCommand(message);
+			})();
+			return await Promise.race([work, overall]);
+		} finally {
+			try {
+				ws.close();
+			} catch {
+				// best-effort close
+			}
+		}
+	}
+
 	/** A map of Node ID -> ongoing sessions */
 	private nodeSessions = new Map<number, Sessions>();
 	private ensureNodeSessions(nodeId: number): Sessions {
@@ -2778,6 +2943,32 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 					}
 				}
 			})();
+		}
+
+		// Phase 5d: pull-based vnode discovery from remote bridge peers.
+		// ZWAVE_JS_BRIDGE_PEERS=ws://host:port[,ws://host2:port2,...]
+		// Replaces the daemon's push-on-timer notify_primary heartbeat —
+		// this primary connects out at startup, reconciles each peer's
+		// hosted vnode list against its own cache, and only triggers
+		// inclusion on cache-misses.
+		const bridgePeers = (process.env.ZWAVE_JS_BRIDGE_PEERS ?? "")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+		console.log(
+			`[bridge-peer-pull] ZWAVE_JS_BRIDGE_PEERS=${
+				process.env.ZWAVE_JS_BRIDGE_PEERS ?? "(unset)"
+			} → parsed ${bridgePeers.length} peer URL(s)`,
+		);
+		if (bridgePeers.length > 0) {
+			void this._pullVirtualNodesFromBridgePeers(bridgePeers).catch(
+				(e) => {
+					console.error(
+						`[bridge-peer-pull] outer promise rejected:`,
+						e,
+					);
+				},
+			);
 		}
 
 		// Phase 4b prototype: advertise an EXISTING virtual node's NIF to HA.
