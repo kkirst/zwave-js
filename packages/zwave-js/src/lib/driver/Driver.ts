@@ -2951,6 +2951,15 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		// this primary connects out at startup, reconciles each peer's
 		// hosted vnode list against its own cache, and only triggers
 		// inclusion on cache-misses.
+		//
+		// Pull is deferred BRIDGE_PEER_PULL_SETTLE_MS after this point
+		// (which itself is just after the "driver ready" emit). Without
+		// the delay, the Pi's InclusionControllerCC.Initiate frame can
+		// arrive at HA's radio while the controller is still in late-
+		// init and gets silently dropped (observed 2026-05-20: notify
+		// at 22:55:08, HA's node-array population at 22:55:43, frame
+		// effectively lost in the 35s window). 10s is comfortably past
+		// every observed late-init step on this hardware.
 		const bridgePeers = (process.env.ZWAVE_JS_BRIDGE_PEERS ?? "")
 			.split(",")
 			.map((s) => s.trim())
@@ -2961,14 +2970,21 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			} → parsed ${bridgePeers.length} peer URL(s)`,
 		);
 		if (bridgePeers.length > 0) {
-			void this._pullVirtualNodesFromBridgePeers(bridgePeers).catch(
-				(e) => {
-					console.error(
-						`[bridge-peer-pull] outer promise rejected:`,
-						e,
-					);
-				},
+			const settleMs = Number(
+				process.env.ZWAVE_JS_BRIDGE_PEER_PULL_SETTLE_MS ?? "10000",
 			);
+			console.log(
+				`[bridge-peer-pull] scheduling pull in ${settleMs}ms (after controller settles)`,
+			);
+			setTimeout(() => {
+				void this._pullVirtualNodesFromBridgePeers(bridgePeers)
+					.catch((e) => {
+						console.error(
+							`[bridge-peer-pull] outer promise rejected:`,
+							e,
+						);
+					});
+			}, settleMs);
 		}
 
 		// Phase 4b prototype: advertise an EXISTING virtual node's NIF to HA.
