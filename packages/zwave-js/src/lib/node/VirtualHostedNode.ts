@@ -486,14 +486,24 @@ export class VirtualHostedNode {
 	 * bridge daemon's power state machine to drive the paddle relay open
 	 * or closed.
 	 *
-	 * Mirrors `setValue` exactly but for the binary CC. Idempotent.
+	 * NOT idempotent on the broadcast side — unlike `setValue` (multilevel),
+	 * `setBinaryValue` ALWAYS broadcasts even when the cached value is
+	 * unchanged. The binary value represents *intent* to drive the paddle
+	 * relay (PSM "I want it closed right now"); the cached state can be
+	 * stale if the relay was toggled externally (e.g. local paddle tap).
+	 * Without an unconditional broadcast, a stale-cached True would cause
+	 * the next PSM ARMING transition to no-op silently, leaving the relay
+	 * open and the intercede flow stuck. `onBinaryValueChange` still only
+	 * fires on actual mutations so external listeners aren't spammed.
 	 */
 	public async setBinaryValue(value: boolean | undefined): Promise<void> {
-		if (this.currentBinaryValue === value) return;
+		const changed = this.currentBinaryValue !== value;
 		const previous = this.currentBinaryValue;
 		this.currentBinaryValue = value;
 		this.targetBinaryValue = value;
-		this.onBinaryValueChange?.(this.id, previous, value);
+		if (changed) {
+			this.onBinaryValueChange?.(this.id, previous, value);
+		}
 		await this._broadcastBinaryValueChange(value);
 	}
 
