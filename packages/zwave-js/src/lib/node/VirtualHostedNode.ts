@@ -12,6 +12,8 @@ import {
 	AssociationGroupInfoCCNameGet,
 	AssociationGroupInfoCCNameReport,
 	AssociationGroupInfoProfile,
+	BasicCCSet,
+	BinarySwitchCCReport,
 	type CommandClass,
 	ManufacturerSpecificCCGet,
 	ManufacturerSpecificCCReport,
@@ -814,6 +816,37 @@ export class VirtualHostedNode {
 				requestedCC: command.requestedCC,
 				ccVersion: this._ccVersionForReport(command.requestedCC),
 			});
+		}
+
+		// ─── BinarySwitchCC.Report  (Task #48) ───────────────────────────
+		// Inbound binary-state Report from a paddle/relay associated to
+		// this vnode (e.g. lifeline or a dedicated group). Mirrors the
+		// reported state into `currentBinaryValue`; fires
+		// `onBinaryValueChange` which the Driver lifts to a
+		// "virtual node binary value updated" event for the bridge daemon.
+		// Returns no response — Reports are unsolicited and don't ACK at
+		// the CC layer (the SupervisionCC envelope, if present, gets a
+		// Success response from the standard handler).
+		if (command instanceof BinarySwitchCCReport) {
+			const v = (command as any).currentValue;
+			if (typeof v === "boolean") {
+				await this.setBinaryValue(v);
+			}
+			return undefined;
+		}
+
+		// ─── BasicCC.Set  (Task #48) ─────────────────────────────────────
+		// Legacy paddles (notably the Zen51 in supervised mode) emit
+		// BasicCC.Set rather than BinarySwitchCC.Report on lifeline. The
+		// target value is 0 for OFF, 0xFF for "restore to last on level"
+		// (treated as ON here), or any 0..99 value for dimming intent.
+		// For our binary-meaning vnodes, any non-zero target = ON.
+		if (command instanceof BasicCCSet) {
+			const t = (command as any).targetValue;
+			if (typeof t === "number") {
+				await this.setBinaryValue(t > 0);
+			}
+			return undefined;
 		}
 
 		// ─── ManufacturerSpecificCC ───────────────────────────────────────

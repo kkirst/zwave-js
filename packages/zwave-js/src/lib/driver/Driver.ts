@@ -1119,6 +1119,25 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 				current,
 			});
 		};
+		// Task #48: mirror the multilevel wiring above for inbound binary
+		// state changes. Fires when `handleCommand` processes a
+		// BinarySwitchCC.Report or BasicCC.Set frame addressed to this
+		// vnode (e.g. a paddle telling its associated lifeline target
+		// that its relay just toggled). Lets the bridge daemon learn
+		// about physical paddle/relay state changes directly through the
+		// vnode itself instead of via the indirect `relay_observer`
+		// lifeline path — important for devices like Zen51 where the
+		// lifeline path is blocked by S2 security-class mismatches.
+		vn.onBinaryValueChange = (nodeId, previous, current) => {
+			this.driverLog.print(
+				`bridge: virtual node ${nodeId} binary value: ${previous} → ${current}`,
+			);
+			(this as any).emit("virtual node binary value updated", {
+				nodeId,
+				previous,
+				current,
+			});
+		};
 		// Phase 5: persist association table mutations so they survive a
 		// driver restart. Fire-and-forget — saveVirtualHostedNodes already
 		// guards against concurrent saves internally.
@@ -1247,7 +1266,14 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		);
 		for (const url of urls) {
 			try {
-				const vnodes = await this._fetchPeerVirtualNodes(url);
+				// Task #49: retry-with-backoff covers transient peer
+				// unavailability (Pi rebooting at the same moment HA
+				// boots, brief network blip, etc.). Up to ~63 s of
+				// grace per round; the outer scheduler retries the
+				// whole round every 5 min.
+				const vnodes = await this._fetchPeerVirtualNodesWithRetry(
+					url,
+				);
 				console.log(
 					`[bridge-peer-pull] ${url}: discovered ${vnodes.length} hosted vnode(s) [${
 						vnodes.map((v) => v.nodeId).join(", ")
@@ -1311,6 +1337,44 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			);
 		}
 		return nodes;
+	}
+
+	/**
+	 * Task #49 — retry wrapper around `_fetchPeerVirtualNodes` with
+	 * exponential backoff. The Phase 5d pull happens at HA startup; if
+	 * the Pi's zwave-js-server is briefly unreachable at that moment
+	 * (Pi rebooting, network blip, etc.), the old code logged and
+	 * abandoned the peer until the next HA restart. With retry, the
+	 * peer gets up to ~63 s (1+2+4+8+16+32) of grace period to come
+	 * online before we give up on this round. The outer
+	 * `_pullVirtualNodesFromBridgePeers` is also called periodically
+	 * (see the setInterval after the settle-then-pull block), so even
+	 * if every attempt in one round fails, the next round 5 min later
+	 * will try fresh.
+	 */
+	private async _fetchPeerVirtualNodesWithRetry(
+		url: string,
+		maxAttempts: number = 6,
+	): Promise<Array<{ nodeId: number; profile: "dimmer" | "binary" }>> {
+		let lastErr: unknown;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				return await this._fetchPeerVirtualNodes(url);
+			} catch (err) {
+				lastErr = err;
+				if (attempt === maxAttempts) break;
+				const backoffMs = Math.min(60000, 1000 * 2 ** (attempt - 1));
+				console.log(
+					`[bridge-peer-pull] ${url}: attempt ${attempt}/${maxAttempts} failed (${
+						(err as Error)?.message ?? err
+					}); retrying in ${backoffMs}ms`,
+				);
+				await new Promise((resolve) =>
+					setTimeout(resolve, backoffMs)
+				);
+			}
+		}
+		throw lastErr;
 	}
 
 	/**
@@ -2985,6 +3049,36 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 						);
 					});
 			}, settleMs);
+
+			// Task #49: periodic re-pull. Catches the case where the
+			// initial pull failed entirely (peer was down past the retry
+			// window) OR where a vnode was added/removed on the peer side
+			// while this primary was already up. Default 5 min; override
+			// via ZWAVE_JS_BRIDGE_PEER_PULL_PERIOD_MS (set to 0 to
+			// disable). Independent of the initial settle delay — the
+			// periodic timer always runs even if the initial pull
+			// succeeded.
+			const periodMs = Number(
+				process.env.ZWAVE_JS_BRIDGE_PEER_PULL_PERIOD_MS ?? "300000",
+			);
+			if (periodMs > 0) {
+				console.log(
+					`[bridge-peer-pull] scheduling periodic re-pull every ${periodMs}ms`,
+				);
+				setInterval(() => {
+					void this._pullVirtualNodesFromBridgePeers(bridgePeers)
+						.catch((e) => {
+							console.error(
+								`[bridge-peer-pull] periodic re-pull rejected:`,
+								e,
+							);
+						});
+				}, periodMs);
+			} else {
+				console.log(
+					`[bridge-peer-pull] periodic re-pull disabled (period=0)`,
+				);
+			}
 		}
 
 		// Phase 4b prototype: advertise an EXISTING virtual node's NIF to HA.
