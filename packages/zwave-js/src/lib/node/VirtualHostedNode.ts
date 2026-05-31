@@ -14,6 +14,7 @@ import {
 	AssociationGroupInfoProfile,
 	BasicCCSet,
 	BinarySwitchCCReport,
+	MultilevelSwitchCCSet,
 	type CommandClass,
 	ManufacturerSpecificCCGet,
 	ManufacturerSpecificCCReport,
@@ -424,6 +425,21 @@ export class VirtualHostedNode {
 		this.targetValue = value;
 		this.onValueChange?.(this.id, previous, value);
 		await this._broadcastValueChange(value);
+	}
+
+	/**
+	 * Apply an INBOUND MultilevelSwitch.Set from a paddle/dimmer
+	 * associated to this vnode. Updates the value + fires onValueChange
+	 * (-> "virtual node value updated" for the bridge daemon) but does
+	 * NOT re-broadcast: the sender already holds this level, and the
+	 * daemon's Shelly-confirmed correction owns LED feedback. Idempotent.
+	 */
+	public setValueFromInbound(value: number | undefined): void {
+		if (this.currentValue === value) return;
+		const previous = this.currentValue;
+		this.currentValue = value;
+		this.targetValue = value;
+		this.onValueChange?.(this.id, previous, value);
 	}
 
 	/**
@@ -845,6 +861,21 @@ export class VirtualHostedNode {
 			const t = (command as any).targetValue;
 			if (typeof t === "number") {
 				await this.setBinaryValue(t > 0);
+			}
+			return undefined;
+		}
+
+		// MultilevelSwitchCC.Set (vnode-as-input): a dimmer paddle endpoint
+		// associated to this vnode's MultilevelSwitch Set Group reports the
+		// level the user dialed in. Mirror it into the vnode value (fires
+		// "virtual node value updated"; the daemon snaps level->state and
+		// drives RF). 0xFF = restore-to-last -> treat as full (99). No
+		// re-broadcast (see setValueFromInbound). Rides the warm
+		// vnode<->paddle peer SPAN = low-latency input path.
+		if (command instanceof MultilevelSwitchCCSet) {
+			const tv = (command as any).targetValue;
+			if (typeof tv === "number") {
+				this.setValueFromInbound(tv === 0xff ? 99 : tv);
 			}
 			return undefined;
 		}
