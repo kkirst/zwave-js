@@ -459,12 +459,19 @@ export class VirtualHostedNode {
 	 */
 	private async _broadcastValueChange(
 		value: number | boolean | undefined,
+		excludeNodeId?: number,
 	): Promise<void> {
 		if (this.sender == null) return;
 		if (value == null) return;
-		const members = this.associations.get(MULTILEVEL_SET_GROUP_ID);
-		if (members == null || members.length === 0) return;
+		const allMembers = this.associations.get(MULTILEVEL_SET_GROUP_ID);
+		if (allMembers == null || allMembers.length === 0) return;
 		if (this.profile !== "dimmer") return;
+		// Exclude the source paddle on a mirror (it already holds the level;
+		// re-sending risks an echo loop). Undefined => broadcast to all.
+		const members = excludeNodeId != null
+			? allMembers.filter((m) => m.nodeId !== excludeNodeId)
+			: allMembers;
+		if (members.length === 0) return;
 		const targetValue = typeof value === "boolean"
 			? (value ? 99 : 0)
 			: Math.max(0, Math.min(99, Math.round(value)));
@@ -875,7 +882,15 @@ export class VirtualHostedNode {
 		if (command instanceof MultilevelSwitchCCSet) {
 			const tv = (command as any).targetValue;
 			if (typeof tv === "number") {
-				this.setValueFromInbound(tv === 0xff ? 99 : tv);
+				const level = tv === 0xff ? 99 : tv;
+				this.setValueFromInbound(level);
+				// Mirror the dialed level to the OTHER members of the
+				// MultilevelSwitch Set Group (paddle LED feedback), excluding the
+				// source paddle (it already holds this level locally; echoing
+				// back risks a loop). Native multi-paddle dimmer-association
+				// behaviour. Fire-and-forget so the input path adds no latency;
+				// the daemon's Shelly-confirmed write still corrects to canonical.
+				void this._broadcastValueChange(level, sourceNodeId);
 			}
 			return undefined;
 		}
