@@ -548,26 +548,34 @@ export class VirtualHostedNode {
 		if (this.profile !== "dimmer") return;
 		const members = this.associations.get(BINARY_SET_GROUP_ID);
 		if (members == null || members.length === 0) return;
-		const ccMod: any = await import("@zwave-js/cc/BinarySwitchCC");
+		const bsMod: any = await import("@zwave-js/cc/BinarySwitchCC");
+		const mlMod: any = await import("@zwave-js/cc/MultilevelSwitchCC");
 		const mcMod: any = await import("@zwave-js/cc/MultiChannelCC");
-		await Promise.allSettled(
-			members.map((m) => {
-				const inner = new ccMod.BinarySwitchCCSet({
+		// The binary/relay value travels two ways so group-3 targets of
+		// either type are driven: BinarySwitch.Set for relays, and
+		// MultilevelSwitch.Set(0/99) for dimmers configured as instant 0/99
+		// relays (e.g. ZEN72) that lack a Binary Switch CC. Each target acts
+		// on whichever CC it supports; the other is ignored at the CC layer.
+		const level = value ? 99 : 0;
+		const wrap = (m: any, inner: any) =>
+			m.endpoint != null && m.endpoint > 0
+				? new mcMod.MultiChannelCCCommandEncapsulation({
 					nodeId: m.nodeId,
 					endpointIndex: 0,
-					targetValue: value,
-				});
-				const cc = m.endpoint != null && m.endpoint > 0
-					? new mcMod.MultiChannelCCCommandEncapsulation({
-						nodeId: m.nodeId,
-						endpointIndex: 0,
-						encapsulated: inner,
-						destination: m.endpoint,
-					})
-					: inner;
-				return this.sender!(this.id, cc);
-			}),
-		);
+					encapsulated: inner,
+					destination: m.endpoint,
+				})
+				: inner;
+		const sends: Promise<unknown>[] = [];
+		for (const m of members) {
+			sends.push(this.sender!(this.id, wrap(m, new bsMod.BinarySwitchCCSet({
+				nodeId: m.nodeId, endpointIndex: 0, targetValue: value,
+			}))));
+			sends.push(this.sender!(this.id, wrap(m, new mlMod.MultilevelSwitchCCSet({
+				nodeId: m.nodeId, endpointIndex: 0, targetValue: level, duration: 0,
+			}))));
+		}
+		await Promise.allSettled(sends);
 	}
 
 	/**
@@ -811,10 +819,14 @@ export class VirtualHostedNode {
 					commands.set(CommandClasses["Binary Switch"], [0x01]);
 				}
 			} else if (command.groupId === BINARY_SET_GROUP_ID) {
-				// Group 3 issues BinarySwitch.Set — used by dimmer-profile
-				// vnodes acting as virtual relays. Pure binary-profile
-				// vnodes don't define group 3.
+				// Group 3 carries the vnode's binary/relay intent. It issues
+				// BinarySwitch.Set for relay targets AND MultilevelSwitch.Set
+				// for dimmers configured as instant 0/99 relays (e.g. ZEN72)
+				// that have no Binary Switch CC — the on/off value travels as a
+				// level (0=off, 99=on). Advertising both lets zwave-js-ui allow
+				// either device type as a group-3 association target.
 				commands.set(CommandClasses["Binary Switch"], [0x01]); // Set
+				commands.set(CommandClasses["Multilevel Switch"], [0x01]); // Set
 			}
 			return new AssociationGroupInfoCCCommandListReport({
 				...addr,
