@@ -1100,6 +1100,24 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 	}
 
 	/**
+	 * Remove a VirtualHostedNode from the runtime map and detach its
+	 * listeners/sender. The radio-side slot de-allocation is performed by
+	 * `Controller.removeVirtualNode`; this clears the host-side registration
+	 * so no further inbound frames are dispatched to the (now-gone) vnode.
+	 * Returns true if a vnode was present. Caller is responsible for
+	 * persisting via `saveVirtualHostedNodes`.
+	 */
+	public unregisterVirtualHostedNode(nodeId: number): boolean {
+		const vn = this.virtualNodes.get(nodeId);
+		if (!vn) return false;
+		vn.onValueChange = undefined;
+		vn.onBinaryValueChange = undefined;
+		vn.onPersistableChange = undefined;
+		vn.sender = undefined;
+		return this.virtualNodes.delete(nodeId);
+	}
+
+	/**
 	 * Register a VirtualHostedNode in the runtime map and wire its value-
 	 * change listener so mutations are observable on the Driver via the
 	 * "virtual node value updated" event. External consumers (e.g.

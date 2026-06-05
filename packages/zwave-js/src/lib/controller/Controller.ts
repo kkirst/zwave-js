@@ -9706,6 +9706,13 @@ export class ZWaveController
 		callbacks: SetSlaveLearnModeCallback[];
 	};
 
+	private _pendingVirtualNodeRemoval?: {
+		nodeId: number;
+		resolve: (cb: SetSlaveLearnModeCallback) => void;
+		reject: (e: Error) => void;
+		startedAt: number;
+	};
+
 	/**
 	 * Sends a CC frame from a hosted virtual slave to a destination node on
 	 * the mesh. Phase 6 capability — needed for the paddle-LED-follows-vnode
@@ -10027,6 +10034,84 @@ export class ZWaveController
 		return result.success;
 	}
 
+	/**
+	 * De-allocate a hosted virtual node: tells the radio to drop the virtual
+	 * slave slot via `SetSlaveLearnMode(nodeId, Remove)`, waits for the
+	 * radio's Done callback, then unregisters it from `driver.virtualNodes`
+	 * and persists the cache.
+	 *
+	 * The slot lives in the radio's NVM and survives cache edits / driver
+	 * restarts, so this is the ONLY way to truly remove a vnode the host
+	 * previously allocated. After removal the host stops answering for the
+	 * node, so the network's primary controller can then clear its stale
+	 * entry via the usual `removeFailedNode`.
+	 */
+	public async removeVirtualNode(nodeId: number): Promise<void> {
+		if (!this.driver.virtualNodes.has(nodeId)) {
+			throw new ZWaveError(
+				`Cannot remove node ${nodeId} — not a hosted virtual node`,
+				ZWaveErrorCodes.Controller_NodeNotFound,
+				nodeId,
+			);
+		}
+		if (
+			this._pendingVirtualNodeInclusion
+			|| this._pendingVirtualNodeRemoval
+		) {
+			throw new ZWaveError(
+				"A virtual-node inclusion/removal is already in progress",
+				ZWaveErrorCodes.Controller_CommandError,
+			);
+		}
+		this.driver.controllerLog.print(
+			`bridge: SetSlaveLearnMode(nodeId=${nodeId}, Remove) — de-allocating virtual slave`,
+		);
+		const result = await this.driver.sendMessage<SetSlaveLearnModeResponse>(
+			new SetSlaveLearnModeRequest({
+				nodeId,
+				mode: SlaveLearnMode.Remove,
+			}),
+		);
+		if (!result.success) {
+			throw new ZWaveError(
+				`Radio refused SetSlaveLearnMode(${nodeId}, Remove)`,
+				ZWaveErrorCodes.Controller_CommandError,
+			);
+		}
+		// Wait for the radio's Done callback (handleSlaveLearnModeCallback
+		// routes it to the pending removal), with a safety timeout so a
+		// missing callback can't wedge future inclusions/removals.
+		await new Promise<SetSlaveLearnModeCallback>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				if (this._pendingVirtualNodeRemoval) {
+					this._pendingVirtualNodeRemoval = undefined;
+					reject(
+						new Error(
+							`Timed out waiting for radio to confirm removal of vnode ${nodeId}`,
+						),
+					);
+				}
+			}, 20000);
+			this._pendingVirtualNodeRemoval = {
+				nodeId,
+				resolve: (cb) => {
+					clearTimeout(timer);
+					resolve(cb);
+				},
+				reject: (e) => {
+					clearTimeout(timer);
+					reject(e);
+				},
+				startedAt: Date.now(),
+			};
+		});
+		this.driver.unregisterVirtualHostedNode(nodeId);
+		await this.driver.saveVirtualHostedNodes();
+		this.driver.controllerLog.print(
+			`bridge: virtual-node ${nodeId} removed from radio + host registry`,
+		);
+	}
+
 	private _pendingSendSlaveNodeInfo?: {
 		srcNodeId: number;
 		destNodeId: number;
@@ -10166,6 +10251,34 @@ export class ZWaveController
 				SlaveLearnModeStatus[msg.status] ?? msg.status
 			} originalNodeId=${msg.originalNodeId} newNodeId=${msg.newNodeId} callbackId=${msg.callbackId}`,
 		);
+
+		// Virtual-node REMOVAL path: the radio fires the same callback
+		// function type for SetSlaveLearnMode(Remove). Route it to a pending
+		// removal first. Done is signaled by AssignNodeIdDone (0x01) or
+		// AssignComplete (0x05) depending on firmware; either ends the wait.
+		const removal = this._pendingVirtualNodeRemoval;
+		if (removal) {
+			if (
+				msg.status === SlaveLearnModeStatus.AssignNodeIdDone
+				|| msg.status === SlaveLearnModeStatus.AssignComplete
+			) {
+				this._pendingVirtualNodeRemoval = undefined;
+				this.driver.controllerLog.print(
+					`bridge: virtual-node ${removal.nodeId} de-allocated by radio after ${
+						Date.now() - removal.startedAt
+					} ms`,
+				);
+				removal.resolve(msg);
+			} else if (msg.status === SlaveLearnModeStatus.Failed) {
+				this._pendingVirtualNodeRemoval = undefined;
+				removal.reject(
+					new Error("Virtual-node removal failed (status=Failed)"),
+				);
+			}
+			// 0x02-0x04 informational stages — keep waiting.
+			return true;
+		}
+
 		const pending = this._pendingVirtualNodeInclusion;
 		if (!pending) {
 			this.driver.controllerLog.print(
