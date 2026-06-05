@@ -13,7 +13,10 @@ import {
 	AssociationGroupInfoCCNameReport,
 	AssociationGroupInfoProfile,
 	BasicCCSet,
+	BinarySwitchCCGet,
 	BinarySwitchCCReport,
+	MultilevelSwitchCCGet,
+	MultilevelSwitchCCReport,
 	MultilevelSwitchCCSet,
 	type CommandClass,
 	ManufacturerSpecificCCGet,
@@ -400,6 +403,29 @@ export class VirtualHostedNode {
 				DEFAULT_BINARY_SET_GROUP,
 			);
 		}
+	}
+
+	/**
+	 * Coherent current level (0..99) for MultilevelSwitch reports. Falls back
+	 * to the binary relay state (on=99 / off=0) when no level has been set, so
+	 * the value never reads "unknown" on the primary's UI.
+	 */
+	private _effectiveLevel(): number {
+		if (typeof this.currentValue === "number") return this.currentValue;
+		if (this.currentBinaryValue != null) {
+			return this.currentBinaryValue ? 99 : 0;
+		}
+		return 0;
+	}
+
+	/**
+	 * Coherent on/off for BinarySwitch reports. Falls back to level>0 when no
+	 * binary state has been set.
+	 */
+	private _effectiveBinaryValue(): boolean {
+		if (this.currentBinaryValue != null) return this.currentBinaryValue;
+		if (typeof this.currentValue === "number") return this.currentValue > 0;
+		return false;
 	}
 
 	/**
@@ -850,6 +876,25 @@ export class VirtualHostedNode {
 				...addr,
 				requestedCC: command.requestedCC,
 				ccVersion: this._ccVersionForReport(command.requestedCC),
+			});
+		}
+
+		// ─── BinarySwitchCC.Get / MultilevelSwitchCC.Get ────────────────
+		// The primary (HA zwave-js-ui) sends these during interview, on
+		// "Refresh Values", and on poll. Without a Report reply the value
+		// stays "unknown" in the UI. Report the vnode's current state,
+		// cross-derived so both CCs read coherently regardless of which
+		// channel the daemon drives (group-2 level vs group-3 binary).
+		if (command instanceof BinarySwitchCCGet) {
+			return new BinarySwitchCCReport({
+				...addr,
+				currentValue: this._effectiveBinaryValue(),
+			});
+		}
+		if (command instanceof MultilevelSwitchCCGet) {
+			return new MultilevelSwitchCCReport({
+				...addr,
+				currentValue: this._effectiveLevel(),
 			});
 		}
 
