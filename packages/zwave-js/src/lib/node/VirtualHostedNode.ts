@@ -429,6 +429,39 @@ export class VirtualHostedNode {
 	}
 
 	/**
+	 * Send an unsolicited `BinarySwitchCC.Report` to the Lifeline (group 1)
+	 * members — i.e. HA's primary — so zwave-js-ui reflects the binary/relay
+	 * state live instead of only on a Get/refresh. Binary state ONLY: the
+	 * level channel stays query-driven so we don't reintroduce the per-tick
+	 * lifeline traffic the Phase-5d pull model removed (adaptive levels churn;
+	 * relay/binary state changes are infrequent). Fire-and-forget; the sender
+	 * auto-encrypts to the primary's S2 class (same path as the group-3
+	 * broadcast). No-op when the lifeline has no members.
+	 */
+	private async _reportBinaryToLifeline(
+		value: boolean | undefined,
+	): Promise<void> {
+		if (this.sender == null || value == null) return;
+		const members = this.associations.get(1);
+		if (members == null || members.length === 0) return;
+		const bsMod: any = await import("@zwave-js/cc/BinarySwitchCC");
+		const sends: Promise<unknown>[] = [];
+		for (const m of members) {
+			sends.push(
+				this.sender!(
+					this.id,
+					new bsMod.BinarySwitchCCReport({
+						nodeId: m.nodeId,
+						endpointIndex: 0,
+						currentValue: value,
+					}),
+				),
+			);
+		}
+		await Promise.allSettled(sends);
+	}
+
+	/**
 	 * Mutate the vnode's value AND auto-broadcast `MultilevelSwitchCC.Set`
 	 * to every member of the MultilevelSwitch Set Group (group 2). Mirrors
 	 * how a real ZEN30 dimmer endpoint behaves: its own value change pushes
@@ -554,6 +587,8 @@ export class VirtualHostedNode {
 		this.targetBinaryValue = value;
 		if (changed) {
 			this.onBinaryValueChange?.(this.id, previous, value);
+			// Live-update the primary's UI with the new relay/binary state.
+			void this._reportBinaryToLifeline(value);
 		}
 		await this._broadcastBinaryValueChange(value);
 	}
