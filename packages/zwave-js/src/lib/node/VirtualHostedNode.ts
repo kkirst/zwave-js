@@ -627,16 +627,30 @@ export class VirtualHostedNode {
 					destination: m.endpoint,
 				})
 				: inner;
-		const sends: Promise<unknown>[] = [];
 		for (const m of members) {
-			sends.push(this.sender!(this.id, wrap(m, new bsMod.BinarySwitchCCSet({
-				nodeId: m.nodeId, endpointIndex: 0, targetValue: value,
-			}))));
-			sends.push(this.sender!(this.id, wrap(m, new mlMod.MultilevelSwitchCCSet({
-				nodeId: m.nodeId, endpointIndex: 0, targetValue: level, duration: 0,
-			}))));
+			// Force a fresh S2 SPAN bootstrap for this drive. For vnode→node
+			// singlecasts, the counter-only SPAN state drifts between drives —
+			// the target then rejects the encrypted Set with NonceReport(SOS)
+			// and, because these sends are fire-and-forget, the command is
+			// lost (the relay never moves). Invalidating the SPAN makes
+			// sendCommandFromVirtualNode re-run the NonceGet→SPAN-extension
+			// bootstrap, which is reliable.
+			this.sm2?.deleteNonce(m.nodeId);
+			// Serialize the BinarySwitch + MultilevelSwitch Sets to the SAME
+			// target: the first re-establishes the SPAN, the second reuses it.
+			// Sending them concurrently races two bootstraps from `none` into
+			// conflicting SPANs, and the target SOS-rejects one (or both).
+			try {
+				await this.sender!(this.id, wrap(m, new bsMod.BinarySwitchCCSet({
+					nodeId: m.nodeId, endpointIndex: 0, targetValue: value,
+				})));
+			} catch { /* best-effort: target may not support BinarySwitch */ }
+			try {
+				await this.sender!(this.id, wrap(m, new mlMod.MultilevelSwitchCCSet({
+					nodeId: m.nodeId, endpointIndex: 0, targetValue: level, duration: 0,
+				})));
+			} catch { /* best-effort: target may not support MultilevelSwitch */ }
 		}
-		await Promise.allSettled(sends);
 	}
 
 	/**
