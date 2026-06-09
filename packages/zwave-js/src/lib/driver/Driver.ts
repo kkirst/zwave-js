@@ -1433,6 +1433,10 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			// longer hosts has been decommissioned → drop from sidecar + HA.
 			for (const rec of [...this.proxyNodes.values()]) {
 				if (rec.peerUrl !== url) continue;
+				// Pinned records are real proxied nodes (e.g. a physical sensor),
+				// not peer-hosted vnodes — they never appear in the hosted list,
+				// so the reconcile must not prune them.
+				if (rec.pinned) continue;
 				if (hostedIds.has(rec.nodeId)) continue;
 				console.log(
 					`[bridge-peer-pull] ${url}: vnode ${rec.nodeId} no longer hosted by peer → pruning from sidecar + HA`,

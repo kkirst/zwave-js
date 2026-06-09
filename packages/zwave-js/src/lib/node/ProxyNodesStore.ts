@@ -73,6 +73,14 @@ export interface ProxyNodeRecord {
 	securityClasses: Record<string, boolean>;
 	/** Bridge profile hint ("dimmer" | "binary"), informational. */
 	profile?: string;
+	/**
+	 * Pinned records are REAL nodes proxied from the peer (e.g. a physical
+	 * sensor the peer included), not peer-hosted virtual nodes. They are
+	 * injected at startup like vnodes but are EXEMPT from the hosted-list
+	 * reconcile-prune (they won't appear in the peer's get_virtual_hosted_nodes),
+	 * so they persist until explicitly removed.
+	 */
+	pinned?: boolean;
 }
 
 interface FileFormat {
