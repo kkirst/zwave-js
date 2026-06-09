@@ -192,6 +192,7 @@ import {
 	createWrappingCounter,
 	getErrorMessage,
 	getenv,
+	getEnumMemberName,
 	isAbortError,
 	isUint8Array,
 	mergeDeep,
@@ -237,6 +238,11 @@ import {
 	loadVirtualNodes,
 	saveVirtualNodes,
 } from "../node/VirtualHostedNodesStore.js";
+import {
+	type ProxyNodeRecord,
+	loadProxyNodes,
+	saveProxyNodes,
+} from "../node/ProxyNodesStore.js";
 import {
 	InterviewStage,
 	NodeStatus,
@@ -1089,6 +1095,16 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 	public readonly virtualNodes = new Map<number, VirtualHostedNode>();
 
 	/**
+	 * Sidecar registry of REMOTE virtual nodes this controller proxies from a
+	 * bridge peer (keyed by nodeId). Persisted to `<cacheDir>/proxy-nodes.json`
+	 * so the bridge-peer-pull can re-materialize them at startup instead of
+	 * re-running a full proxy-inclusion for each (which churns the SUC buffer).
+	 * The peer's live hosted-node list remains authoritative for liveness; this
+	 * is metadata only. See ProxyNodesStore.ts.
+	 */
+	public readonly proxyNodes = new Map<number, ProxyNodeRecord>();
+
+	/**
 	 * Atomically persist the current `virtualNodes` registry to
 	 * `<cacheDir>/virtual-nodes.json`. Called automatically during driver
 	 * shutdown; callers may also invoke explicitly after mutating virtual-
@@ -1097,6 +1113,15 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 	 */
 	public async saveVirtualHostedNodes(): Promise<void> {
 		await saveVirtualNodes(this.cacheDir, this.virtualNodes.values());
+	}
+
+	/**
+	 * Atomically persist the proxied-vnode sidecar to
+	 * `<cacheDir>/proxy-nodes.json`. Cheap; call freely after mutating
+	 * `proxyNodes`.
+	 */
+	public async saveProxyNodes(): Promise<void> {
+		await saveProxyNodes(this.cacheDir, this.proxyNodes.values());
 	}
 
 	/**
@@ -1283,56 +1308,196 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			}]`,
 		);
 		for (const url of urls) {
+			let vnodes:
+				| Array<{ nodeId: number; profile: "dimmer" | "binary" }>
+				| undefined;
 			try {
 				// Task #49: retry-with-backoff covers transient peer
 				// unavailability (Pi rebooting at the same moment HA
 				// boots, brief network blip, etc.). Up to ~63 s of
 				// grace per round; the outer scheduler retries the
 				// whole round every 5 min.
-				const vnodes = await this._fetchPeerVirtualNodesWithRetry(
-					url,
+				vnodes = await this._fetchPeerVirtualNodesWithRetry(url);
+			} catch (err) {
+				// PEER UNREACHABLE — we can't verify liveness, so trust the
+				// sidecar as the best-known truth and re-materialize its vnodes
+				// for this peer so the home keeps working through the outage.
+				// We deliberately do NOT prune here; the periodic re-pull
+				// reconciles (adds new / prunes decommissioned) once the peer is
+				// reachable again.
+				const recs = [...this.proxyNodes.values()].filter(
+					(r) => r.peerUrl === url,
 				);
-				console.log(
-					`[bridge-peer-pull] ${url}: discovered ${vnodes.length} hosted vnode(s) [${
-						vnodes.map((v) => v.nodeId).join(", ")
-					}]`,
-				);
-				let confirmed = 0;
-				let triggered = 0;
-				for (const vn of vnodes) {
-					const known = this._controller?.nodes.has(vn.nodeId)
-						?? false;
-					if (known) {
-						confirmed++;
-						continue;
-					}
-					triggered++;
-					console.log(
-						`[bridge-peer-pull] ${url}: vnode ${vn.nodeId} (profile=${vn.profile}) cache-miss → requesting one-shot notify_primary_of_proxy_inclusion`,
-					);
+				let restored = 0;
+				for (const rec of recs) {
+					if (this._controller?.nodes.has(rec.nodeId)) continue;
 					try {
-						await this._invokePeerCommand(url, {
-							command:
-								"controller.notify_primary_of_proxy_inclusion",
-							newNodeId: vn.nodeId,
-						});
-					} catch (innerErr) {
+						await this._controller?.rematerializeProxyNode(rec);
+						restored++;
+					} catch (e) {
 						console.error(
-							`[bridge-peer-pull] ${url}: notify_primary_of_proxy_inclusion(${vn.nodeId}) failed:`,
-							innerErr,
+							`[bridge-peer-pull] ${url}: unverified rematerialize(${rec.nodeId}) failed:`,
+							e,
 						);
 					}
 				}
-				console.log(
-					`[bridge-peer-pull] ${url}: reconcile done (${confirmed} cache-hit, ${triggered} one-shot include)`,
-				);
-			} catch (err) {
 				console.error(
-					`[bridge-peer-pull] ${url}: pull failed:`,
-					err,
+					`[bridge-peer-pull] ${url}: peer unreachable (${
+						(err as Error)?.message ?? err
+					}); re-materialized ${restored} sidecar vnode(s) UNVERIFIED — will reconcile on reconnect`,
+				);
+				continue;
+			}
+
+			console.log(
+				`[bridge-peer-pull] ${url}: discovered ${vnodes.length} hosted vnode(s) [${
+					vnodes.map((v) => v.nodeId).join(", ")
+				}]`,
+			);
+			const hostedIds = new Set(vnodes.map((v) => v.nodeId));
+			let confirmed = 0;
+			let rematerialized = 0;
+			let included = 0;
+
+			for (const vn of vnodes) {
+				if (this._controller?.nodes.has(vn.nodeId)) {
+					confirmed++;
+					continue;
+				}
+				const rec = this.proxyNodes.get(vn.nodeId);
+				// Re-materialize if we have either a sidecar record OR the node
+				// still in the zwave-js network cache (e.g. the first restart
+				// after deploy, before any sidecar exists). Either is enough to
+				// avoid a full proxy-inclusion and its SUC-buffer churn.
+				const haveCache = this.cacheGet(
+					cacheKeys.node(vn.nodeId).interviewStage,
+				) !== undefined;
+				if (rec || haveCache) {
+					// FAST PATH — re-materialize from the sidecar / network cache.
+					const useRec: ProxyNodeRecord = rec
+						? { ...rec, peerUrl: url }
+						: {
+							nodeId: vn.nodeId,
+							peerUrl: url,
+							deviceClass: { basic: 0, generic: 0, specific: 0 },
+							supportedCCs: [],
+							securityClasses: {},
+							profile: vn.profile,
+						};
+					try {
+						await this._controller?.rematerializeProxyNode(useRec);
+						rematerialized++;
+						continue;
+					} catch (e) {
+						console.error(
+							`[bridge-peer-pull] ${url}: rematerialize(${vn.nodeId}) failed; falling back to proxy-inclusion:`,
+							e,
+						);
+					}
+				}
+				// First time we've seen this vnode (or rematerialize failed):
+				// full proxy-inclusion.
+				included++;
+				console.log(
+					`[bridge-peer-pull] ${url}: vnode ${vn.nodeId} (profile=${vn.profile}) → notify_primary_of_proxy_inclusion`,
+				);
+				try {
+					await this._invokePeerCommand(url, {
+						command:
+							"controller.notify_primary_of_proxy_inclusion",
+						newNodeId: vn.nodeId,
+					});
+				} catch (innerErr) {
+					console.error(
+						`[bridge-peer-pull] ${url}: notify_primary_of_proxy_inclusion(${vn.nodeId}) failed:`,
+						innerErr,
+					);
+				}
+			}
+
+			// Refresh the sidecar from live, fully-interviewed vnodes hosted by
+			// this peer, so a future restart can re-materialize them even if the
+			// zwave-js network cache prunes them.
+			for (const vn of vnodes) {
+				const node = this._controller?.nodes.get(vn.nodeId);
+				if (node && node.interviewStage === InterviewStage.Complete) {
+					this.proxyNodes.set(
+						vn.nodeId,
+						this._buildProxyRecord(node, url, vn.profile),
+					);
+				}
+			}
+
+			// Reconcile / prune: the peer's hosted list is authoritative. Any
+			// sidecar record (or loaded vnode) for THIS peer that the peer no
+			// longer hosts has been decommissioned → drop from sidecar + HA.
+			for (const rec of [...this.proxyNodes.values()]) {
+				if (rec.peerUrl !== url) continue;
+				if (hostedIds.has(rec.nodeId)) continue;
+				console.log(
+					`[bridge-peer-pull] ${url}: vnode ${rec.nodeId} no longer hosted by peer → pruning from sidecar + HA`,
+				);
+				this.proxyNodes.delete(rec.nodeId);
+				this._controller?.removeProxyNode(rec.nodeId);
+			}
+
+			try {
+				await this.saveProxyNodes();
+			} catch (e) {
+				console.error(
+					`[bridge-peer-pull] ${url}: saveProxyNodes failed:`,
+					e,
 				);
 			}
+			console.log(
+				`[bridge-peer-pull] ${url}: reconcile done (${confirmed} present, ${rematerialized} re-materialized, ${included} proxy-included)`,
+			);
 		}
+	}
+
+	/**
+	 * Build a {@link ProxyNodeRecord} snapshot from a live, interviewed proxied
+	 * vnode, for persistence to the sidecar. deviceClass is read straight from
+	 * the network cache (stored as {basic,generic,specific} numbers); supported
+	 * CCs from endpoint 0; granted security classes keyed by enum-member name.
+	 */
+	private _buildProxyRecord(
+		node: ZWaveNode,
+		peerUrl: string,
+		profile?: string,
+	): ProxyNodeRecord {
+		// Extract the innermost numeric key for a device-class field. The cached
+		// deviceClass revives generic/specific as objects (and a prior bug nested
+		// them), so unwrap `.key` to whatever depth until we reach the number.
+		const keyOf = (v: any): number => {
+			let x: any = v;
+			while (x && typeof x === "object" && "key" in x) x = x.key;
+			return typeof x === "number" ? x : 0;
+		};
+		const dc = node.deviceClass as any;
+		const ep0 = node.getEndpoint(0);
+		const supportedCCs = ep0
+			? [...ep0.getCCs()]
+				.filter(([, info]) => info.isSupported)
+				.map(([cc]) => cc as number)
+			: [];
+		const securityClasses: Record<string, boolean> = {};
+		for (const [sc, granted] of node.securityClasses) {
+			securityClasses[getEnumMemberName(SecurityClass, sc)] = granted;
+		}
+		return {
+			nodeId: node.id,
+			peerUrl,
+			deviceClass: {
+				basic: keyOf(dc?.basic),
+				generic: keyOf(dc?.generic),
+				specific: keyOf(dc?.specific),
+			},
+			supportedCCs,
+			isListening: node.isListening ?? false,
+			securityClasses,
+			profile,
+		};
 	}
 
 	/**
@@ -2161,6 +2326,32 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			} catch (e) {
 				this.driverLog.print(
 					`failed to restore virtual hosted nodes (continuing with empty registry): ${
+						(e as Error)?.message ?? e
+					}`,
+					"warn",
+				);
+			}
+
+			// Restore the proxied-vnode sidecar (proxy-nodes.json). This is the
+			// fork's authoritative metadata for REMOTE vnodes proxied from a
+			// bridge peer, used by _pullVirtualNodesFromBridgePeers to
+			// re-materialize them at startup instead of re-including each one.
+			// Non-fatal: a corrupt file just means we fall back to proxy-inclusion.
+			try {
+				const restored = await loadProxyNodes(this.cacheDir);
+				for (const rec of restored) {
+					this.proxyNodes.set(rec.nodeId, rec);
+				}
+				if (restored.length > 0) {
+					this.driverLog.print(
+						`loaded ${restored.length} proxied-vnode sidecar record(s): [${
+							restored.map((n) => n.nodeId).join(", ")
+						}]`,
+					);
+				}
+			} catch (e) {
+				this.driverLog.print(
+					`failed to load proxied-vnode sidecar (continuing without it): ${
 						(e as Error)?.message ?? e
 					}`,
 					"warn",

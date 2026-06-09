@@ -40,6 +40,7 @@ export * from "./serialapi/network-mgmt/IsFailedNodeMessages.js";
 export * from "./serialapi/network-mgmt/RemoveFailedNodeMessages.js";
 export * from "./serialapi/network-mgmt/RemoveNodeFromNetworkRequest.js";
 export * from "./serialapi/network-mgmt/ReplaceFailedNodeRequest.js";
+export * from "./serialapi/network-mgmt/RequestNetworkUpdateMessages.js";
 export * from "./serialapi/network-mgmt/RequestNodeInfoMessages.js";
 export * from "./serialapi/network-mgmt/RequestNodeNeighborUpdateMessages.js";
 export * from "./serialapi/network-mgmt/SetLearnModeMessages.js";

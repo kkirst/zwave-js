@@ -229,6 +229,9 @@ import {
 	type ReplaceFailedNodeResponse,
 	ReplaceFailedNodeStartFlags,
 	ReplaceFailedNodeStatus,
+	type RequestNetworkUpdateCallback,
+	RequestNetworkUpdateRequest,
+	NetworkUpdateStatus,
 	type RequestNodeNeighborUpdateReport,
 	RequestNodeNeighborUpdateRequest,
 	SerialAPISetupCommand,
@@ -322,6 +325,7 @@ import {
 import { isObject } from "alcalzone-shared/typeguards";
 import type { Driver } from "../driver/Driver.js";
 import { cacheKeyUtils, cacheKeys } from "../driver/NetworkCache.js";
+import type { ProxyNodeRecord } from "../node/ProxyNodesStore.js";
 import type { StatisticsEventCallbacks } from "../driver/Statistics.js";
 import { type TaskBuilder, TaskPriority } from "../driver/Task.js";
 import { DeviceClass } from "../node/DeviceClass.js";
@@ -1899,6 +1903,26 @@ export class ZWaveController
 
 		// Now try to deserialize all nodes from the cache
 		await restoreFromCache();
+
+		// Inject persisted proxy vnodes (hosted by a bridge peer) into the
+		// INITIAL node list, so they're restored Complete from the sidecar /
+		// network cache and never surface as a late "node added" (which would
+		// make consumers like zwave-js-ui force a stalling re-interview). We
+		// trust the sidecar here; the bridge-peer-pull reconciles liveness
+		// shortly after (prunes anything the peer no longer hosts, adds new).
+		for (const rec of this.driver.proxyNodes.values()) {
+			if (this._nodes.has(rec.nodeId)) continue;
+			try {
+				await this.rematerializeProxyNode(rec, { emitEvents: false });
+			} catch (e) {
+				this.driver.controllerLog.print(
+					`failed to inject proxied vnode ${rec.nodeId} at startup: ${
+						(e as Error)?.message ?? e
+					}`,
+					"warn",
+				);
+			}
+		}
 
 		// Set manufacturer information for the controller node
 		const controllerValueDB = this.valueDB;
@@ -7894,6 +7918,197 @@ export class ZWaveController
 		}
 
 		return success;
+	}
+
+	/**
+	 * Requests an automatic network update from the SUC/SIS.
+	 *
+	 * When this controller is a secondary/inclusion controller, this pulls the full
+	 * delta of node additions and removals that the SUC/SIS knows about — i.e. nodes
+	 * that were included (or excluded) by another controller — into this controller's
+	 * own node list. Newly learned nodes arrive as `ApplicationUpdate` (NodeAdded)
+	 * frames and are added + interviewed automatically through the normal handling.
+	 *
+	 * This is the standard Z-Wave replication mechanism for keeping an inclusion
+	 * controller's topology current with the SUC/SIS.
+	 *
+	 * @returns the {@link NetworkUpdateStatus} reported by the SUC/SIS.
+	 */
+	public async requestNetworkUpdate(): Promise<NetworkUpdateStatus> {
+		if (!this._sucNodeId) {
+			throw new ZWaveError(
+				`Cannot request a network update without a SUC/SIS in the network!`,
+				ZWaveErrorCodes.Controller_NotSupported,
+			);
+		}
+		if (this._sucNodeId === this._ownNodeId) {
+			throw new ZWaveError(
+				`This controller is the SUC/SIS — it cannot request a network update from itself!`,
+				ZWaveErrorCodes.Controller_NotSupported,
+			);
+		}
+
+		this.driver.controllerLog.print(
+			"requesting an automatic network update from the SUC/SIS...",
+		);
+
+		const result = await this.driver.sendMessage<
+			RequestNetworkUpdateCallback
+		>(new RequestNetworkUpdateRequest());
+
+		this.driver.controllerLog.print(
+			`network update from the SUC/SIS ${
+				result.updateStatus === NetworkUpdateStatus.Done
+					? "completed"
+					: `finished with status ${
+						getEnumMemberName(
+							NetworkUpdateStatus,
+							result.updateStatus,
+						)
+					}`
+			}`,
+		);
+
+		return result.updateStatus;
+	}
+
+	/**
+	 * Re-materialize a proxied virtual node (hosted by a bridge peer) into this
+	 * controller's node list WITHOUT running a fresh proxy-inclusion.
+	 *
+	 * Proxied vnodes live only in software here (never in this controller's NVM),
+	 * so a restart drops them and the bridge-peer-pull would otherwise re-include
+	 * each one — a slow storm that churns the SUC/SIS update buffer. This rebuilds
+	 * the same end-state the proxy-inclusion produces, sourced from the zwave-js
+	 * network cache when it still has the node (rich: CC versions, metadata,
+	 * values) or from the fork's `proxy-nodes.json` sidecar when the cache was
+	 * pruned. Mirrors {@link initNodes} for a cached node.
+	 *
+	 * Liveness is NOT decided here — callers must only pass records the bridge
+	 * peer still confirms hosting.
+	 *
+	 * @returns the (re-)materialized node, or the existing instance if already present.
+	 */
+	public async rematerializeProxyNode(
+		record: ProxyNodeRecord,
+		options: { emitEvents?: boolean } = {},
+	): Promise<ZWaveNode> {
+		// When injected at initNodes-time (emitEvents: false) the node becomes
+		// part of the INITIAL node list, so external consumers (zwave-js-ui) never
+		// see a late "node added" and never force a re-interview. The post-startup
+		// bridge-peer-pull path uses emitEvents: true so consumers learn about
+		// genuinely-new nodes.
+		const { emitEvents = true } = options;
+		const nodeId = record.nodeId;
+		const existing = this._nodes.get(nodeId);
+		if (existing) return existing;
+
+		// Node properties are cache-backed getters. If the zwave-js network cache
+		// still holds node.<id>.* (it was instantiated + saved in a prior session),
+		// a bare construct restores full fidelity; otherwise we seed from the sidecar.
+		const haveRichCache =
+			this.driver.cacheGet(cacheKeys.node(nodeId).interviewStage)
+				!== undefined;
+
+		let newNode: ZWaveNode;
+		if (haveRichCache) {
+			// RICH PATH — identical to initNodes for a cached node.
+			newNode = new ZWaveNode(
+				nodeId,
+				this.driver,
+				undefined,
+				undefined,
+				undefined,
+				this.createValueDBForNode(nodeId),
+			);
+			this._nodes.set(nodeId, newNode);
+		} else {
+			// SEED PATH — cache was pruned; rebuild the core shell from the sidecar.
+			const deviceClass = new DeviceClass(
+				record.deviceClass.basic,
+				record.deviceClass.generic,
+				record.deviceClass.specific,
+			);
+			newNode = new ZWaveNode(
+				nodeId,
+				this.driver,
+				deviceClass,
+				record.supportedCCs as CommandClasses[],
+				[],
+				this.createValueDBForNode(nodeId, new Set()),
+			);
+			this._nodes.set(nodeId, newNode);
+
+			// isListening setter is protected; write the cache-backed value directly.
+			this.driver.cacheSet(
+				cacheKeys.node(nodeId).isListening,
+				record.isListening ?? false,
+			);
+
+			// Restore granted security classes so HA talks S2 to the vnode using
+			// the shared network keys (the keys live in this controller — no
+			// per-node re-bootstrap is needed).
+			for (const [name, granted] of Object.entries(record.securityClasses)) {
+				const sc = (SecurityClass as any)[name];
+				if (typeof sc === "number") {
+					newNode.securityClasses.set(sc, granted);
+				}
+			}
+		}
+
+		// The inclusion controller (bridge peer) set the SUC return route during
+		// the original proxy inclusion.
+		newNode.hasSUCReturnRoute = true;
+
+		// Proxy vnodes are virtual — their "interview" is defined by the bridge /
+		// sidecar, not an over-the-air interview. Always assert Complete (set
+		// BEFORE deserialize so it feeds RESTART_FROM_CACHE) so neither our driver
+		// nor external consumers re-interview them — a re-interview stalls for a
+		// virtual node and leaves it stuck mid-interview. This also overrides a
+		// stale interviewStage that a prior interrupted session may have cached.
+		newNode.interviewStage = InterviewStage.Complete;
+
+		// Restore device config + feed RESTART_FROM_CACHE to the ready machine.
+		try {
+			await newNode.deserialize();
+		} catch {
+			// Non-fatal: keep the shell we built.
+		}
+
+		// Mirror the proxy-inclusion end-state events so external consumers
+		// (e.g. zwave-js-ui) populate their tracking maps, then mark alive so the
+		// ready machine emits "ready". interviewStage is already Complete, so the
+		// "node added" handler's interview is a no-op.
+		if (emitEvents) this.emit("node found", { id: nodeId });
+		newNode.markAsAlive();
+		if (emitEvents) {
+			this.emit("node added", newNode, { lowSecurity: false });
+		}
+
+		this.driver.controllerLog.print(
+			`re-materialized proxied vnode ${nodeId} from ${
+				haveRichCache ? "network cache" : "sidecar"
+			}${emitEvents ? "" : " (startup inject)"} (no re-inclusion)`,
+		);
+
+		return newNode;
+	}
+
+	/**
+	 * Remove a proxied virtual node that the bridge peer has decommissioned.
+	 * Mirrors the exclusion cleanup: notify listeners, then forget the node so
+	 * its cache entries are dropped on the next save. Used by the bridge-peer-pull
+	 * reconcile when a vnode is no longer in the peer's authoritative hosted list.
+	 */
+	public removeProxyNode(nodeId: number): boolean {
+		const node = this._nodes.get(nodeId);
+		if (!node) return false;
+		this.driver.controllerLog.print(
+			`proxied vnode ${nodeId} decommissioned by bridge peer — removing from the node list`,
+		);
+		this.emit("node removed", node, RemoveNodeReason.ProxyExcluded);
+		this._nodes.delete(nodeId);
+		return true;
 	}
 
 	/**
