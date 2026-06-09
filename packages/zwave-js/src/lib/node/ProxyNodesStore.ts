@@ -33,6 +33,16 @@ export const PROXY_NODES_FILENAME = "proxy-nodes.json";
 
 const FORMAT_VERSION = 1;
 
+/** Per-CC interview info captured for faithful re-materialization. */
+export interface ProxyCCInfo {
+	/** Command class id (e.g. 0x26 Multilevel Switch). */
+	id: number;
+	/** Interviewed CC version (0 = unknown). */
+	version: number;
+	/** Whether the CC is accessed securely (S2/S0). */
+	secure: boolean;
+}
+
 export interface ProxyNodeRecord {
 	/** The proxied node's ID (as seen on this controller and the peer). */
 	nodeId: number;
@@ -44,8 +54,15 @@ export interface ProxyNodeRecord {
 		generic: number;
 		specific: number;
 	};
-	/** Supported command classes (endpoint 0). */
+	/** Supported command classes (endpoint 0) — legacy id-only list. */
 	supportedCCs: number[];
+	/**
+	 * Full per-CC interview info (endpoint 0): id + version + secure. This is
+	 * what lets re-materialization rebuild the node to its *interviewed* self —
+	 * a bare id list loses the CC versions (e.g. Multilevel Switch v4, Binary
+	 * Switch v2) and secure flags, leaving hollow v0 CCs with no entities.
+	 */
+	commandClasses?: ProxyCCInfo[];
 	/** Whether the node is always-listening (vnodes are typically non-listening). */
 	isListening?: boolean;
 	/**

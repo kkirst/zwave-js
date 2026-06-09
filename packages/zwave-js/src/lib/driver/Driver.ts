@@ -1476,11 +1476,17 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		};
 		const dc = node.deviceClass as any;
 		const ep0 = node.getEndpoint(0);
-		const supportedCCs = ep0
-			? [...ep0.getCCs()]
-				.filter(([, info]) => info.isSupported)
-				.map(([cc]) => cc as number)
+		const supportedCCInfo = ep0
+			? [...ep0.getCCs()].filter(([, info]) => info.isSupported)
 			: [];
+		const supportedCCs = supportedCCInfo.map(([cc]) => cc as number);
+		// Full per-CC info so re-materialization restores the interviewed CC
+		// versions + secure flags, not hollow v0 CCs.
+		const commandClasses = supportedCCInfo.map(([cc, info]) => ({
+			id: cc as number,
+			version: info.version ?? 0,
+			secure: !!info.secure,
+		}));
 		const securityClasses: Record<string, boolean> = {};
 		for (const [sc, granted] of node.securityClasses) {
 			securityClasses[getEnumMemberName(SecurityClass, sc)] = granted;
@@ -1494,6 +1500,7 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 				specific: keyOf(dc?.specific),
 			},
 			supportedCCs,
+			commandClasses,
 			isListening: node.isListening ?? false,
 			securityClasses,
 			profile,

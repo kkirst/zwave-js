@@ -8075,6 +8075,24 @@ export class ZWaveController
 			// Non-fatal: keep the shell we built.
 		}
 
+		// Apply the interviewed CC info (version + secure flags) from the sidecar
+		// so the node is rebuilt to its INTERVIEWED self — a bare supported-CC id
+		// list loses versions (e.g. Multilevel Switch v4, Binary Switch v2) and
+		// secure flags, leaving hollow v0 CCs with no working entities. Applying
+		// here also repairs any hollow CC info left in the network cache.
+		if (record.commandClasses?.length) {
+			const ep0 = newNode.getEndpoint(0);
+			if (ep0) {
+				for (const cc of record.commandClasses) {
+					ep0.addCC(cc.id, {
+						isSupported: true,
+						version: cc.version,
+						secure: cc.secure,
+					});
+				}
+			}
+		}
+
 		// Mirror the proxy-inclusion end-state events so external consumers
 		// (e.g. zwave-js-ui) populate their tracking maps, then mark alive so the
 		// ready machine emits "ready". interviewStage is already Complete, so the
