@@ -15,6 +15,15 @@ import {
 	BasicCCSet,
 	BinarySwitchCCGet,
 	BinarySwitchCCReport,
+	ConfigurationCCGet,
+	ConfigurationCCInfoGet,
+	ConfigurationCCInfoReport,
+	ConfigurationCCNameGet,
+	ConfigurationCCNameReport,
+	ConfigurationCCPropertiesGet,
+	ConfigurationCCPropertiesReport,
+	ConfigurationCCReport,
+	ConfigurationCCSet,
 	MultilevelSwitchCCGet,
 	MultilevelSwitchCCReport,
 	MultilevelSwitchCCSet,
@@ -45,6 +54,7 @@ import {
 } from "@zwave-js/cc";
 import {
 	CommandClasses,
+	ConfigValueFormat,
 	SecurityClass,
 	SecurityManager2,
 	ZWaveLibraryTypes,
@@ -56,7 +66,7 @@ import {
  * picks one when provisioning; the inclusion flow uses it to construct the
  * Node Information Frame the radio transmits during virtual-node learn-mode.
  */
-export type VirtualHostedNodeProfile = "dimmer" | "binary";
+export type VirtualHostedNodeProfile = "dimmer" | "binary" | "logic";
 
 /**
  * Z-Wave Node Information Frame fields a virtual hosted node advertises on
@@ -164,10 +174,48 @@ export const PROFILE_BINARY: VirtualHostedNodeNIF = {
 	controlledCCs: [],
 };
 
+/**
+ * The "Logic Combiner" profile. A binary-switch end node that, unlike the
+ * plain binary profile, also advertises **Configuration CC** — its four params
+ * (logic operation / inverted / delay-on / delay-off) are served over the air
+ * so zwave-js-ui renders them and HA auto-creates `config_parameter` entities.
+ *
+ * The bridge daemon owns the actual logic: it reads the params + the "Logic
+ * Inputs" association group (group 3) membership, computes the combined boolean,
+ * and drives the vnode's binary value — which auto-broadcasts `BinarySwitchCC.Set`
+ * (0xFF/0x00) to the "On/Off Control" group (group 2) members.
+ */
+export const PROFILE_LOGIC: VirtualHostedNodeNIF = {
+	basicDeviceClass: BASIC_DEVICE_CLASS_ROUTING_SLAVE,
+	genericDeviceClass: GENERIC_DEVICE_CLASS_BINARY_SWITCH,
+	specificDeviceClass: SPECIFIC_DEVICE_CLASS_BINARY_POWER_SWITCH,
+	supportedCCs: [
+		CommandClasses.Basic,
+		CommandClasses["Binary Switch"],
+		CommandClasses.Configuration,
+		CommandClasses.Association,
+		CommandClasses["Multi Channel Association"],
+		CommandClasses["Association Group Information"],
+		CommandClasses.Version,
+		CommandClasses["Z-Wave Plus Info"],
+		CommandClasses["Manufacturer Specific"],
+		CommandClasses.Security,
+		CommandClasses["Security 2"],
+	],
+	controlledCCs: [],
+};
+
 export function profileNIF(
 	profile: VirtualHostedNodeProfile,
 ): VirtualHostedNodeNIF {
-	return profile === "dimmer" ? PROFILE_DIMMER : PROFILE_BINARY;
+	switch (profile) {
+		case "dimmer":
+			return PROFILE_DIMMER;
+		case "logic":
+			return PROFILE_LOGIC;
+		default:
+			return PROFILE_BINARY;
+	}
 }
 
 /** Default Lifeline group every virtual node advertises (group 1). */
@@ -218,6 +266,94 @@ export const DEFAULT_BINARY_SET_GROUP: VirtualHostedAssociationGroup = {
 /** Group ID for the BinarySwitch Set Group. */
 export const BINARY_SET_GROUP_ID = 3;
 
+/**
+ * Group 2 on a logic-combiner ("logic") vnode: "On/Off Control". Members
+ * receive `BinarySwitchCC.Set` 0xFF/0x00 whenever the combined logic output
+ * changes. The load to switch (e.g. the garage light) is associated here.
+ */
+export const DEFAULT_ONOFF_CONTROL_GROUP: VirtualHostedAssociationGroup = {
+	label: "On/Off Control",
+	maxNodes: 5,
+	isLifeline: false,
+};
+
+/** Group ID for the logic profile's On/Off Control (binary Set) output group. */
+export const ONOFF_CONTROL_GROUP_ID = 2;
+
+/**
+ * Group 3 on a logic-combiner vnode: "Logic Inputs". Unlike a normal
+ * association group this is used as an INPUT set, not an output target — the
+ * bridge daemon reads its membership to learn which nodes' binary states to
+ * combine. The vnode never actually sends commands to these members; adding a
+ * node here just tells the daemon "include this node in the logic".
+ */
+export const DEFAULT_LOGIC_INPUTS_GROUP: VirtualHostedAssociationGroup = {
+	label: "Logic Inputs",
+	maxNodes: 16,
+	isLifeline: false,
+};
+
+/** Group ID for the logic profile's Logic Inputs membership group. */
+export const LOGIC_INPUTS_GROUP_ID = 3;
+
+/** One Configuration CC parameter the logic profile advertises over the air. */
+interface LogicParamDef {
+	name: string;
+	info: string;
+	valueSize: number;
+	min: number;
+	max: number;
+	default: number;
+}
+
+/**
+ * The four config params a logic-combiner vnode serves. Insertion order defines
+ * the Configuration-CC scan chain (param N → nextParameter N+1, last → 0). The
+ * daemon reads these values to drive the logic engine; the values themselves
+ * are stored per-instance in `configValues` and persisted to the vnode cache.
+ */
+export const LOGIC_PARAMS: ReadonlyMap<number, LogicParamDef> = new Map([
+	[1, {
+		name: "Logic Operation",
+		info:
+			"How the inputs combine: 0 = AND, 1 = OR, 2 = XOR (exactly one true).",
+		valueSize: 1,
+		min: 0,
+		max: 2,
+		default: 1,
+	}],
+	[2, {
+		name: "Inverted",
+		info:
+			"Invert the result: 0 = Normal, 1 = Inverted (AND/OR/XOR → NAND/NOR/XNOR).",
+		valueSize: 1,
+		min: 0,
+		max: 1,
+		default: 0,
+	}],
+	[3, {
+		name: "Delay On (seconds)",
+		info:
+			"Seconds the logic must stay true before the output turns on; a drop to false restarts it.",
+		valueSize: 2,
+		min: 0,
+		max: 65535,
+		default: 0,
+	}],
+	[4, {
+		name: "Delay Off (seconds)",
+		info:
+			"Seconds the output stays on after the logic goes false; a rise to true restarts it.",
+		valueSize: 2,
+		min: 0,
+		max: 65535,
+		default: 0,
+	}],
+]);
+
+/** Ordered param numbers, for the Configuration-CC scan chain. */
+const LOGIC_PARAM_NUMBERS: readonly number[] = Array.from(LOGIC_PARAMS.keys());
+
 /** Persistence schema version. Bump on incompatible format changes. */
 const PERSISTENCE_VERSION = 1;
 
@@ -236,6 +372,12 @@ export interface VirtualHostedNodePersistence {
 	 * flow in Phase 4. Empty until then.
 	 */
 	securityKeys: Record<string, string>;
+	/**
+	 * Configuration CC parameter values, keyed by parameter number (as string).
+	 * Only present for the "logic" profile. Optional for back-compat with
+	 * caches written before the logic profile existed.
+	 */
+	configValues?: Record<string, number>;
 }
 
 /**
@@ -266,6 +408,15 @@ export class VirtualHostedNode {
 		number,
 		VirtualHostedAssociationMember[]
 	>();
+
+	/**
+	 * Configuration CC parameter values, keyed by parameter number. Only
+	 * populated for the "logic" profile (seeded with `LOGIC_PARAMS` defaults in
+	 * the constructor). Mutated by an inbound `ConfigurationCC.Set` (from
+	 * zwave-js-ui / HA) or by the daemon via `setConfigValue`; persisted to the
+	 * vnode cache so values survive a server restart.
+	 */
+	public readonly configValues = new Map<number, number>();
 
 	/**
 	 * S2 keys per security class. Populated during inclusion (Phase 4) when
@@ -354,6 +505,18 @@ export class VirtualHostedNode {
 	public onPersistableChange?: (nodeId: number) => void;
 
 	/**
+	 * Optional listener fired after a Configuration CC parameter value changes
+	 * (via inbound `ConfigurationCC.Set` or `setConfigValue`). The driver wires
+	 * this to emit a "virtual node config updated" event so the bridge daemon's
+	 * logic engine re-reads the param live, and to flush the vnode cache.
+	 */
+	public onConfigChange?: (
+		nodeId: number,
+		parameter: number,
+		value: number,
+	) => void;
+
+	/**
 	 * Sends a CommandClass FROM this virtual node TO the destination
 	 * encoded in `command.nodeId`. Wired by the driver in
 	 * `registerVirtualHostedNode` to `controller.sendCommandFromVirtualNode`.
@@ -385,24 +548,61 @@ export class VirtualHostedNode {
 		this.id = id;
 		this.profile = profile;
 		this.nif = profileNIF(profile);
-		// Every virtual node starts with the standard Lifeline group +
-		// the MultilevelSwitch Set Group (group 2). Users add their target
-		// paddle endpoints to group 2 via HA's zwave-js-ui frontend; the
-		// vnode auto-pushes Sets to them on every value change.
+		// Every virtual node starts with the standard Lifeline group (1).
 		this.associationGroups.set(1, DEFAULT_LIFELINE_GROUP);
-		this.associationGroups.set(
-			MULTILEVEL_SET_GROUP_ID,
-			DEFAULT_MULTILEVEL_SET_GROUP,
-		);
-		// Group 3 only exists on dimmer-profile vnodes (which advertise both
-		// MultilevelSwitch and BinarySwitch CCs). On a pure binary-profile
-		// vnode, the binary CC sits on group 2 instead.
-		if (profile === "dimmer") {
+		if (profile === "logic") {
+			// Logic-combiner layout: contiguous 1..3 so AGI GroupingsGet stays
+			// consistent. Group 2 = On/Off Control (BinarySwitch Set output),
+			// group 3 = Logic Inputs (membership read by the daemon). No
+			// MultilevelSwitch group. Seed Configuration CC params with their
+			// defaults so a freshly-provisioned vnode has sane values.
 			this.associationGroups.set(
-				BINARY_SET_GROUP_ID,
-				DEFAULT_BINARY_SET_GROUP,
+				ONOFF_CONTROL_GROUP_ID,
+				DEFAULT_ONOFF_CONTROL_GROUP,
 			);
+			this.associationGroups.set(
+				LOGIC_INPUTS_GROUP_ID,
+				DEFAULT_LOGIC_INPUTS_GROUP,
+			);
+			for (const [param, def] of LOGIC_PARAMS) {
+				this.configValues.set(param, def.default);
+			}
+		} else {
+			// Dimmer/binary layout: Lifeline + the MultilevelSwitch Set Group
+			// (group 2). Users add their target paddle endpoints to group 2 via
+			// zwave-js-ui; the vnode auto-pushes Sets on every value change.
+			this.associationGroups.set(
+				MULTILEVEL_SET_GROUP_ID,
+				DEFAULT_MULTILEVEL_SET_GROUP,
+			);
+			// Group 3 only exists on dimmer-profile vnodes (which advertise both
+			// MultilevelSwitch and BinarySwitch CCs). On a pure binary-profile
+			// vnode, the binary CC sits on group 2 instead.
+			if (profile === "dimmer") {
+				this.associationGroups.set(
+					BINARY_SET_GROUP_ID,
+					DEFAULT_BINARY_SET_GROUP,
+				);
+			}
 		}
+	}
+
+	/**
+	 * Apply a Configuration CC parameter value (from an inbound Set or a daemon
+	 * write). Clamps to the param's declared range, stores it, and fires
+	 * `onConfigChange` when the value actually changes. No-op for unknown
+	 * params or non-logic profiles. Returns the stored (clamped) value.
+	 */
+	public setConfigValue(parameter: number, value: number): number | undefined {
+		const def = LOGIC_PARAMS.get(parameter);
+		if (def == null) return undefined;
+		const clamped = Math.max(def.min, Math.min(def.max, Math.round(value)));
+		const previous = this.configValues.get(parameter);
+		this.configValues.set(parameter, clamped);
+		if (previous !== clamped) {
+			this.onConfigChange?.(this.id, parameter, clamped);
+		}
+		return clamped;
 	}
 
 	/**
@@ -606,8 +806,15 @@ export class VirtualHostedNode {
 	): Promise<void> {
 		if (this.sender == null) return;
 		if (value == null) return;
-		if (this.profile !== "dimmer") return;
-		const members = this.associations.get(BINARY_SET_GROUP_ID);
+		// The binary Set output lives on group 3 for dimmer vnodes and group 2
+		// ("On/Off Control") for logic vnodes. Other profiles don't broadcast.
+		const outputGroupId = this.profile === "dimmer"
+			? BINARY_SET_GROUP_ID
+			: this.profile === "logic"
+			? ONOFF_CONTROL_GROUP_ID
+			: undefined;
+		if (outputGroupId == null) return;
+		const members = this.associations.get(outputGroupId);
 		if (members == null || members.length === 0) return;
 		const bsMod: any = await import("@zwave-js/cc/BinarySwitchCC");
 		const mlMod: any = await import("@zwave-js/cc/MultilevelSwitchCC");
@@ -645,11 +852,17 @@ export class VirtualHostedNode {
 					nodeId: m.nodeId, endpointIndex: 0, targetValue: value,
 				})));
 			} catch { /* best-effort: target may not support BinarySwitch */ }
-			try {
-				await this.sender!(this.id, wrap(m, new mlMod.MultilevelSwitchCCSet({
-					nodeId: m.nodeId, endpointIndex: 0, targetValue: level, duration: 0,
-				})));
-			} catch { /* best-effort: target may not support MultilevelSwitch */ }
+			// Dimmer AND logic vnodes ALSO send MultilevelSwitch.Set(0/99) so a
+			// ZEN72-style dimmer (no Binary Switch CC) used as an On/Off Control
+			// load is driven. Each target acts on whichever CC it supports; the
+			// other is ignored at the CC layer.
+			if (this.profile === "dimmer" || this.profile === "logic") {
+				try {
+					await this.sender!(this.id, wrap(m, new mlMod.MultilevelSwitchCCSet({
+						nodeId: m.nodeId, endpointIndex: 0, targetValue: level, duration: 0,
+					})));
+				} catch { /* best-effort: target may not support MultilevelSwitch */ }
+			}
 		}
 	}
 
@@ -849,11 +1062,17 @@ export class VirtualHostedNode {
 				hasDynamicInfo: false,
 				groups: groupIds.map((gid) => {
 					const g = this.associationGroups.get(gid);
+					// For logic vnodes the group IDs mean different things:
+					// group 2 = On/Off Control (issues BinarySwitch.Set), group
+					// 3 = Logic Inputs (an input membership list that issues
+					// nothing). Other profiles: groups 2/3 are Set groups.
+					const isControlGroup = this.profile === "logic"
+						? gid === ONOFF_CONTROL_GROUP_ID
+						: gid === MULTILEVEL_SET_GROUP_ID
+							|| gid === BINARY_SET_GROUP_ID;
 					const profile = g?.isLifeline
 						? AssociationGroupInfoProfile["General: Lifeline"]
-						: gid === MULTILEVEL_SET_GROUP_ID
-						? AssociationGroupInfoProfile["Control: Key 01"]
-						: gid === BINARY_SET_GROUP_ID
+						: isControlGroup
 						? AssociationGroupInfoProfile["Control: Key 01"]
 						: AssociationGroupInfoProfile["General: N/A"];
 					return {
@@ -890,10 +1109,21 @@ export class VirtualHostedNode {
 					commands.set(CommandClasses["Multilevel Switch"], [
 						0x01,
 					]); // Set
+				} else if (this.profile === "logic") {
+					// Group 2 is the logic vnode's "On/Off Control" output. It
+					// drives relays (BinarySwitch.Set) AND dimmers configured as
+					// instant 0/99 relays (e.g. ZEN72, MultilevelSwitch.Set) that
+					// have no Binary Switch CC. Advertising both lets zwave-js-ui
+					// allow either device type as an association target.
+					commands.set(CommandClasses["Binary Switch"], [0x01]); // Set
+					commands.set(CommandClasses["Multilevel Switch"], [0x01]); // Set
 				} else {
 					commands.set(CommandClasses["Binary Switch"], [0x01]);
 				}
-			} else if (command.groupId === BINARY_SET_GROUP_ID) {
+			} else if (
+				command.groupId === BINARY_SET_GROUP_ID
+				&& this.profile !== "logic"
+			) {
 				// Group 3 carries the vnode's binary/relay intent. It issues
 				// BinarySwitch.Set for relay targets AND MultilevelSwitch.Set
 				// for dimmers configured as instant 0/99 relays (e.g. ZEN72)
@@ -926,6 +1156,97 @@ export class VirtualHostedNode {
 				requestedCC: command.requestedCC,
 				ccVersion: this._ccVersionForReport(command.requestedCC),
 			});
+		}
+
+		// ─── ConfigurationCC (logic profile) ─────────────────────────────
+		// The logic-combiner vnode serves its four params over the air so
+		// zwave-js-ui renders them (and HA auto-creates config_parameter
+		// entities). The v3 interview discovers params by walking the
+		// PropertiesGet → nextParameter chain (param 0 → 1 → 2 → 3 → 4 → 0),
+		// then queries Name/Info/Get per param. Sets are applied to
+		// `configValues` and fire onConfigChange (→ daemon re-reads live).
+		if (command instanceof ConfigurationCCPropertiesGet) {
+			const param = command.parameter;
+			// param 0 is the "find first parameter" probe — report no value and
+			// point at the first real param.
+			if (param === 0) {
+				return new ConfigurationCCPropertiesReport({
+					...addr,
+					parameter: 0,
+					valueSize: 0,
+					valueFormat: ConfigValueFormat.UnsignedInteger,
+					nextParameter: LOGIC_PARAM_NUMBERS[0] ?? 0,
+				});
+			}
+			const def = LOGIC_PARAMS.get(param);
+			if (def == null) {
+				// Unknown param: valueSize 0 = unsupported, end the chain.
+				return new ConfigurationCCPropertiesReport({
+					...addr,
+					parameter: param,
+					valueSize: 0,
+					valueFormat: ConfigValueFormat.UnsignedInteger,
+					nextParameter: 0,
+				});
+			}
+			const idx = LOGIC_PARAM_NUMBERS.indexOf(param);
+			const next = idx >= 0 && idx + 1 < LOGIC_PARAM_NUMBERS.length
+				? LOGIC_PARAM_NUMBERS[idx + 1]
+				: 0;
+			return new ConfigurationCCPropertiesReport({
+				...addr,
+				parameter: param,
+				valueSize: def.valueSize,
+				valueFormat: ConfigValueFormat.UnsignedInteger,
+				minValue: def.min,
+				maxValue: def.max,
+				defaultValue: def.default,
+				nextParameter: next,
+				isReadonly: false,
+				isAdvanced: false,
+				noBulkSupport: false,
+			});
+		}
+		if (command instanceof ConfigurationCCNameGet) {
+			const def = LOGIC_PARAMS.get(command.parameter);
+			return new ConfigurationCCNameReport({
+				...addr,
+				parameter: command.parameter,
+				name: def?.name ?? `Parameter ${command.parameter}`,
+				reportsToFollow: 0,
+			});
+		}
+		if (command instanceof ConfigurationCCInfoGet) {
+			const def = LOGIC_PARAMS.get(command.parameter);
+			return new ConfigurationCCInfoReport({
+				...addr,
+				parameter: command.parameter,
+				info: def?.info ?? "",
+				reportsToFollow: 0,
+			});
+		}
+		if (command instanceof ConfigurationCCGet) {
+			const def = LOGIC_PARAMS.get(command.parameter);
+			if (def == null) return undefined;
+			return new ConfigurationCCReport({
+				...addr,
+				parameter: command.parameter,
+				value: this.configValues.get(command.parameter)
+					?? def.default,
+				valueSize: def.valueSize,
+				valueFormat: ConfigValueFormat.UnsignedInteger,
+			});
+		}
+		if (command instanceof ConfigurationCCSet) {
+			const param = command.parameter;
+			const def = LOGIC_PARAMS.get(param);
+			if (def == null) return undefined;
+			if (command.resetToDefault) {
+				this.setConfigValue(param, def.default);
+			} else if (typeof command.value === "number") {
+				this.setConfigValue(param, command.value);
+			}
+			return undefined;
 		}
 
 		// ─── BinarySwitchCC.Get / MultilevelSwitchCC.Get ────────────────
@@ -1010,7 +1331,11 @@ export class VirtualHostedNode {
 				// type/id are arbitrary internal identifiers.
 				manufacturerId: 0x0312,
 				productType: 0xbeef,
-				productId: this.profile === "dimmer" ? 0x0001 : 0x0002,
+				productId: this.profile === "dimmer"
+					? 0x0001
+					: this.profile === "logic"
+					? 0x0003
+					: 0x0002,
 			});
 		}
 
@@ -1176,6 +1501,8 @@ export class VirtualHostedNode {
 				return 4;
 			case CommandClasses["Binary Switch"]:
 				return 2;
+			case CommandClasses.Configuration:
+				return 4;
 			case CommandClasses.Association:
 				return 3;
 			case CommandClasses["Multi Channel Association"]:
@@ -1217,6 +1544,10 @@ export class VirtualHostedNode {
 		for (const [sc, bytes] of this.securityKeys.entries()) {
 			securityKeys[String(sc)] = Buffer.from(bytes).toString("base64");
 		}
+		const configValues: Record<string, number> = {};
+		for (const [param, value] of this.configValues.entries()) {
+			configValues[String(param)] = value;
+		}
 		return {
 			v: PERSISTENCE_VERSION,
 			id: this.id,
@@ -1224,6 +1555,7 @@ export class VirtualHostedNode {
 			associationGroups,
 			associations,
 			securityKeys,
+			configValues,
 		};
 	}
 
@@ -1254,6 +1586,34 @@ export class VirtualHostedNode {
 				BINARY_SET_GROUP_ID,
 				DEFAULT_BINARY_SET_GROUP,
 			);
+		}
+		// Logic profile backfill: ensure the On/Off Control + Logic Inputs
+		// groups exist.
+		if (data.profile === "logic") {
+			if (!node.associationGroups.has(ONOFF_CONTROL_GROUP_ID)) {
+				node.associationGroups.set(
+					ONOFF_CONTROL_GROUP_ID,
+					DEFAULT_ONOFF_CONTROL_GROUP,
+				);
+			}
+			if (!node.associationGroups.has(LOGIC_INPUTS_GROUP_ID)) {
+				node.associationGroups.set(
+					LOGIC_INPUTS_GROUP_ID,
+					DEFAULT_LOGIC_INPUTS_GROUP,
+				);
+			}
+		}
+		// Restore persisted Configuration CC values, then backfill any missing
+		// param with its default (so a cache from before a param was added
+		// still has a value). The constructor already seeded defaults for the
+		// logic profile; persisted values override them.
+		for (const [param, value] of Object.entries(data.configValues ?? {})) {
+			node.configValues.set(Number(param), value);
+		}
+		for (const [param, def] of LOGIC_PARAMS) {
+			if (data.profile === "logic" && !node.configValues.has(param)) {
+				node.configValues.set(param, def.default);
+			}
 		}
 		for (const [gid, members] of Object.entries(data.associations)) {
 			node.associations.set(

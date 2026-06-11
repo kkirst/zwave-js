@@ -1138,6 +1138,7 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 		vn.onValueChange = undefined;
 		vn.onBinaryValueChange = undefined;
 		vn.onPersistableChange = undefined;
+		vn.onConfigChange = undefined;
 		vn.sender = undefined;
 		return this.virtualNodes.delete(nodeId);
 	}
@@ -1188,6 +1189,33 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			this.driverLog.print(
 				`bridge: virtual node ${nodeId} associations changed; flushing cache`,
 			);
+			// Let external consumers (the bridge daemon) learn that a vnode's
+			// association membership changed — e.g. a node added/removed from a
+			// logic vnode's "Logic Inputs" group — so they can re-read it.
+			(this as any).emit("virtual node associations updated", {
+				nodeId,
+			});
+			void this.saveVirtualHostedNodes().catch((err) => {
+				this.driverLog.print(
+					`bridge: failed to persist virtual nodes: ${
+						(err as Error)?.message ?? err
+					}`,
+					"error",
+				);
+			});
+		};
+		// Logic profile: a Configuration CC param changed (via zwave-js-ui / HA
+		// or a daemon write). Emit it for the daemon's logic engine and flush
+		// the cache so the value survives a server restart.
+		vn.onConfigChange = (nodeId, parameter, value) => {
+			this.driverLog.print(
+				`bridge: virtual node ${nodeId} config param ${parameter} → ${value}`,
+			);
+			(this as any).emit("virtual node config updated", {
+				nodeId,
+				parameter,
+				value,
+			});
 			void this.saveVirtualHostedNodes().catch((err) => {
 				this.driverLog.print(
 					`bridge: failed to persist virtual nodes: ${
@@ -1284,6 +1312,71 @@ export class Driver extends TypedEventTarget<DriverEventCallbacks>
 			);
 		}
 		vn.setBinaryValue(value);
+	}
+
+	/**
+	 * Set a Configuration CC parameter on a hosted virtual node (logic
+	 * profile). Used by the bridge daemon to seed defaults at provision time.
+	 * Clamps to the param's range; fires "virtual node config updated" if the
+	 * value changes. Returns the stored value (or undefined for unknown params).
+	 */
+	public setVirtualHostedNodeConfigValue(
+		nodeId: number,
+		parameter: number,
+		value: number,
+	): number | undefined {
+		const vn = this.virtualNodes.get(nodeId);
+		if (!vn) {
+			throw new Error(
+				`setVirtualHostedNodeConfigValue: node ${nodeId} is not a hosted virtual node`,
+			);
+		}
+		return vn.setConfigValue(parameter, value);
+	}
+
+	/**
+	 * Snapshot a hosted virtual node's current state for external consumers
+	 * (the bridge daemon reads config param values + association group
+	 * membership to drive its logic engine). Returns undefined if the node is
+	 * not a hosted virtual node.
+	 */
+	public getVirtualHostedNodeState(nodeId: number):
+		| {
+			id: number;
+			profile: string;
+			config: Record<number, number>;
+			associations: Record<number, { nodeId: number; endpoint?: number }[]>;
+			associationGroups: Record<number, { label: string; maxNodes: number; isLifeline: boolean }>;
+		}
+		| undefined
+	{
+		const vn = this.virtualNodes.get(nodeId);
+		if (!vn) return undefined;
+		const config: Record<number, number> = {};
+		for (const [param, value] of vn.configValues.entries()) {
+			config[param] = value;
+		}
+		const associations: Record<
+			number,
+			{ nodeId: number; endpoint?: number }[]
+		> = {};
+		for (const [gid, members] of vn.associations.entries()) {
+			associations[gid] = members.map((m) => ({ ...m }));
+		}
+		const associationGroups: Record<
+			number,
+			{ label: string; maxNodes: number; isLifeline: boolean }
+		> = {};
+		for (const [gid, g] of vn.associationGroups.entries()) {
+			associationGroups[gid] = { ...g };
+		}
+		return {
+			id: vn.id,
+			profile: vn.profile,
+			config,
+			associations,
+			associationGroups,
+		};
 	}
 
 	/**
